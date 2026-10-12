@@ -19,3 +19,4 @@ tests/fixtures/private/
 *.webp
 *.task
 *.tflite
+!tests/fixtures/portrait.jpg

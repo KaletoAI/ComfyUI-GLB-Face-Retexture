@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.0.2 — 2026-10-12
+
+- Fix face color under a `baseColorFactor` below 1: the photo is now inverted in linear light as glTF specifies, so viewers show the photo color instead of an sRGB-space approximation (for example 146 instead of 100). Unrepresentable bright colors are counted in `factor_clipped_texture_pixels`.
+- Fix gutter bleed: atlas padding no longer overwrites masked-out or occluded texels inside face triangles; it extends only outside the face UV footprint and continues the island's own edge colors.
+- Make the registration residual gate independent: the three exactly fitted anchors are no longer averaged into the 30 % eye-span check.
+- Vectorize triangle rasterization for rendering and atlas painting with identical z-buffer tie rules (about 18× faster; 203k triangles at 768 px in 2.5 s instead of 44 s).
+- Cancelling a prompt in ComfyUI now stops the CPU worker; a stuck worker is stopped after 1800 s (`GLB_FACE_RETEXTURE_TIMEOUT`). Worker logs go to files and are decoded as UTF-8, so large or non-ASCII output can neither block nor hide an error.
+- Add `install.py --recreate` to rebuild an unusable private `.venv`; the installer and node now point to it instead of looping on the plain installer.
+- Pass package-index, certificate, proxy and cache variables (`PIP_INDEX_URL`, `PIP_CERT`, `UV_INDEX_URL`, `UV_SYSTEM_CERTS`, ...) to pip/uv while still dropping install-target overrides.
+- Reject malformed glTF references (missing attributes, negative or out-of-range indices, undecodable images) as clear `FaceTextureError`s and refuse images smaller than 32 px.
+- Proof schema 2: render checks use the atlases decoded from the written GLB, `output_triangle_count` is read from the emitted index accessors, and the reference is hashed both as file (`reference_file_sha256`) and as decoded RGB (`reference_rgb_sha256`).
+- Publish GLB, comparison and proof only together, so a late failure leaves no partial result.
+- Extend the suite from 14 to 31 tests, including the ComfyUI bridge and a real CPU MediaPipe end-to-end run on a public-domain portrait fixture.
+- Add a release workflow: pushing a `v*` tag that matches `pyproject.toml` creates the GitHub release from this changelog section.
+
 ## 1.0.1 — 2026-10-12
 
 - Fix installation on Linux ARM64: select MediaPipe 0.10.18 only for Linux aarch64 workers, using its official CPython 3.12 wheel; retain 0.10.21 on other platforms.

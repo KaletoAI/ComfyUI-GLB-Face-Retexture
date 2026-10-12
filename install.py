@@ -12,8 +12,10 @@ import urllib.request
 
 from worker_runtime import (
     MODELS,
+    installer_command,
     private_venv_directory,
     probe_python,
+    remove_private_venv,
     verify_worker,
     worker_environment,
 )
@@ -91,14 +93,25 @@ def run(command: list[str]) -> None:
     subprocess.run(command, env=worker_environment(), check=True, cwd=PACKAGE_DIR)
 
 
-def install_worker(python_option: str | None, uv_option: str | None) -> None:
-    venv = private_venv_directory(PACKAGE_DIR)
+def install_worker(python_option: str | None, uv_option: str | None, recreate: bool = False) -> None:
     uv = executable_path(uv_option, "uv") if uv_option else shutil.which("uv")
     if uv:
         uv = str(Path(uv).resolve())
     # Reject even an explicitly requested wrong-version Python before touching packages.
     python = select_python(python_option)
-    if not venv.exists():
+    if recreate:
+        if not python and not uv:
+            raise RuntimeError("Refusing to remove .venv: neither Python 3.12 nor uv is available to rebuild it.")
+        print("Removing the private worker .venv for a clean rebuild.")
+        remove_private_venv(PACKAGE_DIR)
+    venv = private_venv_directory(PACKAGE_DIR)
+    if venv.exists():
+        try:
+            verify_worker(PACKAGE_DIR)
+        except (OSError, RuntimeError, subprocess.CalledProcessError, ValueError) as exc:
+            raise RuntimeError(f"The existing private worker {venv} is unusable ({exc}). "
+                               f"Rebuild it with: {installer_command(PACKAGE_DIR, recreate=True)}") from exc
+    else:
         if python:
             run([*python, "-I", "-m", "venv", str(venv)])
         elif uv:
@@ -127,9 +140,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--python", dest="python_option", default=os.environ.get("PYTHON312"), help="Existing Python 3.12 executable (also PYTHON312).")
     parser.add_argument("--uv", dest="uv_option", default=os.environ.get("UV_BIN"), help="uv executable (also UV_BIN, otherwise discovered on PATH).")
+    parser.add_argument("--recreate", action="store_true", help="Delete and rebuild this package's private .venv (nothing else is removed).")
     arguments = parser.parse_args()
     try:
-        install_worker(arguments.python_option, arguments.uv_option)
+        install_worker(arguments.python_option, arguments.uv_option, arguments.recreate)
     except (OSError, RuntimeError, subprocess.CalledProcessError, ValueError) as exc:
         print(f"GLBFaceRetexture installation failed: {exc}", file=sys.stderr)
         return 1

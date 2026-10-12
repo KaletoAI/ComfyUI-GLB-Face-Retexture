@@ -13,7 +13,7 @@ Geometry is preserved, but the output is **not a byte-identical GLB**: original 
 
 The CPU worker runs in a private `.venv` with its own MediaPipe dependencies. It does not install worker dependencies into ComfyUI, use ComfyUI's GPU environment, or silently fall back to the ComfyUI interpreter. The interactive workflow was verified on Linux with ComfyUI 0.37.0, frontend 1.53.6 and Comfy Python 3.13.14. A Windows ComfyUI GUI session has not yet been verified.
 
-Worker dependency selection uses standard pip platform markers: **Linux ARM64** (`sys_platform == "linux"` and `platform_machine == "aarch64"`) uses **MediaPipe 0.10.18**; all other platforms retain **0.10.21**. Version 0.10.21 has no Linux ARM64 wheel. The [official 0.10.18 PyPI release](https://pypi.org/project/mediapipe/0.10.18/#files) provides a CPython 3.12 `manylinux_2_17_aarch64` wheel; this does not cover musl/Alpine, 32-bit ARM, or Windows ARM64. The private worker and native workflow were also verified on **Linux ARM64 / NVIDIA GB10**, Python 3.12.3, ComfyUI 0.37.0 and frontend 1.53.6: all 14 worker tests pass, and a real photo/GLB run preserves every original triangle and reports zero changed protected-body pixels. ComfyUI's main environment remains separate.
+Worker dependency selection uses standard pip platform markers: **Linux ARM64** (`sys_platform == "linux"` and `platform_machine == "aarch64"`) uses **MediaPipe 0.10.18**; all other platforms retain **0.10.21**. Version 0.10.21 has no Linux ARM64 wheel. The [official 0.10.18 PyPI release](https://pypi.org/project/mediapipe/0.10.18/#files) provides a CPython 3.12 `manylinux_2_17_aarch64` wheel; this does not cover musl/Alpine, 32-bit ARM, or Windows ARM64. The private worker and native workflow were also verified on **Linux ARM64 / NVIDIA GB10**, Python 3.12.3, ComfyUI 0.37.0 and frontend 1.53.6: all 14 worker tests of release 1.0.1 pass, and a real photo/GLB run preserves every original triangle and reports zero changed protected-body pixels. ComfyUI's main environment remains separate.
 
 ## Install
 
@@ -69,6 +69,10 @@ install.py --uv /path/to/uv
 
 The installer creates `.venv`, installs `requirements-worker.txt` there, and downloads hash-checked models into `models/`. Restart ComfyUI after installation, then hard-refresh the browser so the node and native widgets load.
 
+Re-running the installer updates an intact worker. If the existing `.venv` is unusable (wrong Python version, system site-packages enabled, deleted interpreter, or a link pointing outside the package), the installer refuses it and asks you to rebuild it with `install.py --recreate`. That option deletes only this package's `.venv` (a link is removed, never followed) and only when Python 3.12 or uv is available to rebuild it.
+
+Package mirrors and corporate certificates work through environment variables: `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL`, `PIP_TRUSTED_HOST`, `PIP_CERT`, `UV_INDEX_URL`, `UV_DEFAULT_INDEX`, `UV_INDEX`, `UV_SYSTEM_CERTS`, `UV_CACHE_DIR`, `SSL_CERT_FILE` and related index/proxy/cache settings are passed through. pip and uv configuration files and install-target overrides such as `PIP_TARGET`, `PIP_PREFIX`, `PIP_USER` or `UV_SYSTEM_PYTHON` are ignored so nothing can be installed into ComfyUI's environment.
+
 ## Use the editable workflow
 
 Open [`workflows/glb-face-retexture.json`](workflows/glb-face-retexture.json) in ComfyUI. Its seven visible nodes are fully editable; upload selectors are deliberately empty:
@@ -88,7 +92,11 @@ Open [`workflows/glb-face-retexture.json`](workflows/glb-face-retexture.json) in
 | `render_resolution` | 768 / 256–2048, step 64 | CPU registration/render resolution; higher settings require more work. |
 | `yaw` | 0 / −180–180 degrees | Source viewing yaw for face registration; not mesh deformation. |
 
-Outputs are native **`FILE_3D`** (`corrected_glb`), **`IMAGE`** (`comparison`) and **`STRING`** (`proof_metrics`). The metrics are also shown as node text and describe geometry/texture preservation observations. The corrected GLB can connect directly to native preview and save nodes.
+Outputs are native **`FILE_3D`** (`corrected_glb`), **`IMAGE`** (`comparison`) and **`STRING`** (`proof_metrics`). The metrics are also shown as node text and describe geometry/texture preservation observations. They are measured on the exported GLB itself: its materials' embedded atlases are decoded and rendered again, so `protected_body_changed_render_pixels` checks the written file, not the in-memory intent. The corrected GLB can connect directly to native preview and save nodes.
+
+The photo color is matched under glTF's `baseColorFactor`, which multiplies the decoded (linear) texture. Where a factor below 1 cannot reproduce a bright photo color, the texel saturates and `factor_clipped_texture_pixels` counts it.
+
+Cancelling the prompt in ComfyUI stops the CPU worker. A worker that runs longer than 1800 seconds is stopped with an error; set the environment variable `GLB_FACE_RETEXTURE_TIMEOUT` (seconds) before starting ComfyUI to change that limit.
 
 ## Supported inputs and limits
 
@@ -124,8 +132,8 @@ On Windows:
 .venv\Scripts\python.exe -m unittest discover -s tests -t .
 ```
 
-Private-worker installation and tests passed in [GitHub CI on Ubuntu and Windows](https://github.com/KaletoAI/ComfyUI-GLB-Face-Retexture/actions/runs/38292162093). The suite has 14 tests; Windows skips the one symlink-creation test that requires additional privileges. This includes actual CPU Face Landmarker execution, but does not establish a verified Windows ComfyUI GUI session.
+GitHub CI installs the private worker on Ubuntu and Windows and runs the suite there. The suite has 31 tests; Windows skips the one symlink-creation test that requires additional privileges. It covers the ComfyUI bridge with stub Comfy/torch modules and a real CPU MediaPipe run on a public-domain portrait fixture (see [`tests/fixtures/README.md`](tests/fixtures/README.md)), but does not establish a verified Windows ComfyUI GUI session.
 
-The intended package ID is **`glb-face-retexture`**, version **1.0.0**. It is **not yet listed in Comfy Registry**; use the GitHub URL installation above. Workflow `cnr_id` metadata records the intended ID, not evidence of registration.
+The intended package ID is **`glb-face-retexture`**, version **1.0.2**. It is **not yet listed in Comfy Registry**; use the GitHub URL installation above. Workflow `cnr_id` metadata records the intended ID, not evidence of registration.
 
 Before publishing, the owner must obtain the actual Comfy Registry publisher identity, add its real `PublisherId` under `[tool.comfy]` in `pyproject.toml`, obtain the corresponding registry API key, and publish using the [official registry instructions](https://docs.comfy.org/registry/publishing). No publisher identity or credentials are fabricated here, and there is no automatic publishing workflow.
