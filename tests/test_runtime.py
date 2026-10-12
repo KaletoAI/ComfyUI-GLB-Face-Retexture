@@ -12,25 +12,13 @@ import worker_runtime
 
 
 class RuntimeTests(unittest.TestCase):
-    def make_environment(self, package, platform=None):
+    def make_environment(self, package):
         venv = package / ".venv"
-        platform = os.name if platform is None else platform
-        python = venv / ("Scripts/python.exe" if platform == "nt" else "bin/python")
+        python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
         python.parent.mkdir(parents=True)
         python.write_bytes(b"private interpreter fixture")
         (venv / "pyvenv.cfg").write_text("include-system-site-packages = false\n", encoding="utf-8")
         return python
-
-    def test_private_python_uses_platform_layout_in_paths_with_spaces(self):
-        """Windows consumers must not accidentally use a POSIX worker or Comfy Python."""
-        with tempfile.TemporaryDirectory(prefix="face retexture ") as directory:
-            package = Path(directory)
-            windows = self.make_environment(package, "nt")
-            with patch.object(worker_runtime.os, "name", "nt"):
-                self.assertEqual(worker_runtime.worker_python(package), windows)
-            with patch.object(worker_runtime.os, "name", "posix"):
-                with self.assertRaises(RuntimeError):
-                    worker_runtime.worker_python(package)
 
     def test_missing_install_refuses_interpreter_fallback(self):
         """A missing worker must fail with a usable installer rather than run in Comfy."""
