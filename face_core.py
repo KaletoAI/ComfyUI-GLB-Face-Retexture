@@ -12,8 +12,10 @@ import hashlib
 import io
 import json
 import math
+import os
 from pathlib import Path
 import struct
+import tempfile
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
@@ -29,6 +31,24 @@ _WIDTHS = {'SCALAR': 1, 'VEC2': 2, 'VEC3': 3, 'VEC4': 4}
 
 class FaceTextureError(ValueError):
     """Unsupported input or an observation gate failed; no passthrough success."""
+
+
+def _ref(doc, key, index):
+    """Resolve a glTF index strictly; negative or non-integer indices are malformed."""
+    items = doc.get(key)
+    if isinstance(index, bool) or not isinstance(index, int) or not isinstance(items, list) or not 0 <= index < len(items):
+        raise FaceTextureError(f'Invalid glTF {key} reference: {index!r}')
+    return items[index]
+
+
+def _srgb_to_linear(values):
+    c = np.asarray(values, dtype=np.float64) / 255
+    return np.where(c <= .04045, c / 12.92, ((c + .055) / 1.055) ** 2.4)
+
+
+def _linear_to_srgb(values):
+    linear = np.clip(values, 0, None)
+    return 255 * np.where(linear <= .0031308, linear * 12.92, 1.055 * linear ** (1 / 2.4) - .055)
 
 
 def parse_glb(raw):
@@ -58,10 +78,10 @@ def parse_glb(raw):
 
 
 def accessor_array(doc, binary, index):
-    accessor = doc['accessors'][index]
+    accessor = _ref(doc, 'accessors', index)
     if accessor.get('sparse') or 'bufferView' not in accessor:
         raise FaceTextureError('Sparse or missing-buffer accessors are unsupported')
-    view = doc['bufferViews'][accessor['bufferView']]
+    view = _ref(doc, 'bufferViews', accessor['bufferView'])
     if view.get('buffer', 0) != 0 or view.get('extensions'):
         raise FaceTextureError('External or compressed accessor buffers are unsupported')
     try:
@@ -104,6 +124,14 @@ def _node_matrix(node):
 
 
 def read_source(path):
+    """Load a supported source; malformed glTF never escapes as a bare KeyError."""
+    try:
+        return _read_source(path)
+    except (KeyError, IndexError, TypeError, AttributeError) as exc:
+        raise FaceTextureError(f'Malformed glTF document: {exc!r}') from exc
+
+
+def _read_source(path):
     raw = Path(path).read_bytes()
     doc, binary = parse_glb(raw)
     if doc.get('asset', {}).get('version') != '2.0':
@@ -122,7 +150,7 @@ def read_source(path):
     for image in doc.get('images', []):
         if 'uri' in image or 'bufferView' not in image or image.get('extensions') or image.get('mimeType') not in ('image/png', 'image/jpeg'):
             raise FaceTextureError('Only embedded PNG/JPEG textures are supported; external/compressed textures are unsupported')
-        view = doc['bufferViews'][image['bufferView']]
+        view = _ref(doc, 'bufferViews', image['bufferView'])
         start = int(view.get('byteOffset', 0))
         stop = start + int(view['byteLength'])
         if start < 0 or stop > len(binary):
@@ -145,7 +173,7 @@ def read_source(path):
     if len(positions) < 3 or np.any(uv < -1e-6) or np.any(uv > 1 + 1e-6):
         raise FaceTextureError('Empty mesh or tiled/out-of-range UVs are unsupported for atlas painting')
     if 'indices' in primitive:
-        index_doc = doc['accessors'][primitive['indices']]
+        index_doc = _ref(doc, 'accessors', primitive['indices'])
         if index_doc['componentType'] not in (5121, 5123, 5125) or index_doc['type'] != 'SCALAR' or index_doc.get('normalized'):
             raise FaceTextureError('Indices must be unsigned integer scalars')
         indices = accessor_array(doc, binary, primitive['indices']).astype(np.int64)
@@ -161,7 +189,7 @@ def read_source(path):
     def visit(index, parent, ancestry):
         if index in ancestry:
             raise FaceTextureError('Cyclic node graph')
-        node = nodes[index]
+        node = _ref(doc, 'nodes', index)
         if node.get('skin') is not None or node.get('weights') or node.get('extensions'):
             raise FaceTextureError('Skinned, weighted or extended nodes are unsupported')
         matrix = parent @ _node_matrix(node)
@@ -179,20 +207,24 @@ def read_source(path):
         raise FaceTextureError('Expected exactly one mesh instance')
     world = positions @ instances[0][:3, :3].T + instances[0][:3, 3]
     try:
-        material = doc['materials'][primitive['material']]
+        material = _ref(doc, 'materials', primitive['material'])
         color = material['pbrMetallicRoughness']['baseColorTexture']
-        texture = doc['textures'][color['index']]
+        texture = _ref(doc, 'textures', color['index'])
+        _ref(doc, 'images', texture['source'])
         image_index = texture['source']
-    except (KeyError, IndexError) as exc:
+    except (KeyError, FaceTextureError) as exc:
         raise FaceTextureError('Source requires an embedded base-color texture and material') from exc
     if material.get('extensions') or color.get('extensions') or color.get('texCoord', 0) != 0 or texture.get('extensions') or material.get('alphaMode', 'OPAQUE') != 'OPAQUE':
         raise FaceTextureError('Extended/transformed textures, alternate UVs and non-opaque materials are unsupported')
     factor = np.asarray(material['pbrMetallicRoughness'].get('baseColorFactor', [1, 1, 1, 1]), dtype=float)
     if factor.shape != (4,) or not np.isfinite(factor).all() or np.any(factor[:3] <= 0):
         raise FaceTextureError('Base-color factor cannot encode the portrait')
-    sampler = doc.get('samplers', [])[texture['sampler']] if 'sampler' in texture else {}
-    with Image.open(io.BytesIO(images[image_index])) as image:
-        atlas = np.array(image.convert('RGBA'))
+    sampler = _ref(doc, 'samplers', texture['sampler']) if 'sampler' in texture else {}
+    try:
+        with Image.open(io.BytesIO(images[image_index])) as image:
+            atlas = np.array(image.convert('RGBA'))
+    except (OSError, Image.DecompressionBombError) as exc:
+        raise FaceTextureError('Embedded base-color image cannot be decoded') from exc
     return {'raw': raw, 'gltf': doc, 'binary': binary, 'images': images,
             'attributes': attributes, 'positions': world, 'uv': uv, 'triangles': triangles,
             'primitive': primitive, 'material': material, 'texture': texture,
@@ -219,24 +251,52 @@ def make_view(positions, resolution, yaw, bounds=None):
             'yaw_degrees': float(yaw)}
 
 
-def _raster_triangle(triangle, width, height, centers):
-    low = np.maximum(np.floor(triangle.min(axis=0) - centers).astype(int), 0)
-    high = np.minimum(np.ceil(triangle.max(axis=0) - centers).astype(int), [width-1, height-1])
-    if np.any(high < low):
-        return None
-    a, b, c = triangle
-    e1, e2 = b-a, c-a
-    determinant = e1[0]*e2[1] - e1[1]*e2[0]
-    if abs(determinant) < 1e-10:
-        return None
-    xx, yy = np.meshgrid(np.arange(low[0], high[0]+1), np.arange(low[1], high[1]+1))
-    points = np.c_[xx.ravel(), yy.ravel()]
-    delta = points + centers - a
-    u = (delta[:, 0]*e2[1] - delta[:, 1]*e2[0]) / determinant
-    v = (e1[0]*delta[:, 1] - e1[1]*delta[:, 0]) / determinant
-    bary = np.c_[1-u-v, u, v]
-    inside = (bary >= -1e-7).all(axis=1)
-    return points[inside], bary[inside]
+def _raster_batch(triangles, width, height, centers, budget=1 << 20):
+    """Yield (triangle, pixel, barycentric) rows for pixel centers inside each triangle.
+
+    Vectorized over triangles in chunks of about `budget` bounding-box samples.
+    """
+    triangles = np.asarray(triangles, dtype=np.float64).reshape(-1, 3, 2)
+    low = np.maximum(np.floor(triangles.min(axis=1) - centers).astype(np.int64), 0)
+    high = np.minimum(np.ceil(triangles.max(axis=1) - centers).astype(np.int64), [width-1, height-1])
+    e1, e2 = triangles[:, 1]-triangles[:, 0], triangles[:, 2]-triangles[:, 0]
+    determinant = e1[:, 0]*e2[:, 1] - e1[:, 1]*e2[:, 0]
+    size = high - low + 1
+    ids = np.flatnonzero((size > 0).all(axis=1) & (np.abs(determinant) >= 1e-10))
+    counts = size[ids, 0] * size[ids, 1]
+    ends = np.cumsum(counts)
+    first = 0
+    while first < len(ids):
+        done = ends[first-1] if first else 0
+        last = max(int(np.searchsorted(ends, done + budget, side='right')), first + 1)
+        chunk, chunk_counts = ids[first:last], counts[first:last]
+        tri = np.repeat(chunk, chunk_counts)
+        offset = np.arange(int(chunk_counts.sum())) - np.repeat(np.cumsum(chunk_counts) - chunk_counts, chunk_counts)
+        columns = size[tri, 0]
+        points = low[tri] + np.c_[offset % columns, offset // columns]
+        delta = points + centers - triangles[tri, 0]
+        u = (delta[:, 0]*e2[tri, 1] - delta[:, 1]*e2[tri, 0]) / determinant[tri]
+        v = (e1[tri, 0]*delta[:, 1] - e1[tri, 1]*delta[:, 0]) / determinant[tri]
+        bary = np.c_[1-u-v, u, v]
+        inside = (bary >= -1e-7).all(axis=1)
+        yield tri[inside], points[inside], bary[inside]
+        first = last
+
+
+def _winners(keys, score, order):
+    """Rows holding the highest score per key; ties keep the lowest order.
+
+    This equals sequential first-wins updates with a strict `score > best` test.
+    """
+    if not len(keys):
+        return np.zeros(0, dtype=np.int64)
+    sort = np.lexsort((order, -score, keys))
+    sorted_keys = keys[sort]
+    return sort[np.r_[True, sorted_keys[1:] != sorted_keys[:-1]]]
+
+
+def _interpolate(bary, values):
+    return np.einsum('ij,ij...->i...', bary, values)
 
 
 def _texture_rgb(source, uv, atlas):
@@ -262,36 +322,52 @@ def _texture_rgb(source, uv, atlas):
     fx, fy = fraction[:, 0:1], fraction[:, 1:2]
     rgb = (atlas[y0, x0, :3]*(1-fx)*(1-fy) + atlas[y0, x1, :3]*fx*(1-fy)
            + atlas[y1, x0, :3]*(1-fx)*fy + atlas[y1, x1, :3]*fx*fy)
-    return rgb * source['factor'][:3]
+    factor = source['factor'][:3]
+    if np.all(factor == 1):
+        return rgb
+    # glTF multiplies baseColorFactor with the linear (decoded sRGB) texel.
+    return _linear_to_srgb(_srgb_to_linear(rgb) * factor)
 
 
-def render_albedo(source, view, face_atlas=None, selected=None):
+def render_albedo(source, view, face_atlas=None, selected=None, atlases=None, assignment=None):
+    """Z-buffered orthographic albedo render.
+
+    Each triangle samples `atlases[assignment[t]]`; `face_atlas`/`selected` is the
+    two-atlas shorthand (original atlas for unselected triangles).
+    """
+    if atlases is None:
+        atlases = [source['atlas']] if face_atlas is None else [source['atlas'], face_atlas]
+        assignment = None if face_atlas is None else np.asarray(selected, dtype=np.int64)
     resolution = view['resolution']
     rgb = np.full((resolution, resolution, 3), 245, dtype=np.uint8)
     depth = np.full((resolution, resolution), -np.inf)
     owners = np.full((resolution, resolution), -1, dtype=np.int32)
-    xy = view['xy']
-    projected = xy[source['triangles']]
-    visible_box = ((projected.max(axis=1) >= 0).all(axis=1)
-                   & (projected.min(axis=1) <= resolution).all(axis=1))
-    for index in np.flatnonzero(visible_box):
-        ids = source['triangles'][index]
-        raster = _raster_triangle(xy[ids], resolution, resolution, .5)
-        if raster is None:
-            continue
-        points, bary = raster
-        if not len(points):
-            continue
-        z = bary @ view['depth'][ids]
-        keep = z > depth[points[:, 1], points[:, 0]]
-        points, bary, z = points[keep], bary[keep], z[keep]
-        if not len(points):
-            continue
-        atlas = face_atlas if face_atlas is not None and selected[index] else source['atlas']
-        values = _texture_rgb(source, bary @ source['uv'][ids], atlas)
-        rgb[points[:, 1], points[:, 0]] = np.rint(values.clip(0, 255)).astype(np.uint8)
-        depth[points[:, 1], points[:, 0]] = z
-        owners[points[:, 1], points[:, 0]] = index
+    triangles = source['triangles']
+    projected = view['xy'][triangles]
+    candidates = np.flatnonzero((projected.max(axis=1) >= 0).all(axis=1)
+                                & (projected.min(axis=1) <= resolution).all(axis=1))
+    parts = []
+    for local, points, bary in _raster_batch(projected[candidates], resolution, resolution, .5):
+        tri = candidates[local]
+        z = _interpolate(bary, view['depth'][triangles[tri]])
+        keys = points[:, 1]*resolution + points[:, 0]
+        keep = _winners(keys, z, tri)
+        parts.append((keys[keep], z[keep], tri[keep], bary[keep]))
+    if parts:
+        keys, z, tri, bary = (np.concatenate(column) for column in zip(*parts))
+        keep = _winners(keys, z, tri)
+        keys, z, tri, bary = keys[keep], z[keep], tri[keep], bary[keep]
+        py, px = np.divmod(keys, resolution)
+        uv = _interpolate(bary, source['uv'][triangles[tri]])
+        which = np.zeros(len(tri), dtype=np.int64) if assignment is None else assignment[tri]
+        values = np.empty((len(tri), 3))
+        for index, atlas in enumerate(atlases):
+            rows = which == index
+            if rows.any():
+                values[rows] = _texture_rgb(source, uv[rows], atlas)
+        rgb[py, px] = np.rint(values.clip(0, 255)).astype(np.uint8)
+        depth[py, px] = z
+        owners[py, px] = tri
     return {'rgb': rgb, 'depth': depth, 'owners': owners, 'view': view}
 
 
@@ -314,6 +390,8 @@ def _face_box(landmarks, width, height):
 def detect_face(detector, mp, rgb, label):
     """Search/refine RGB crops; every result is remapped to the actual image."""
     height, width = rgb.shape[:2]
+    if min(height, width) < 32:
+        raise FaceTextureError(label + ': image is too small for face detection (minimum 32 pixels per side)')
     attempts = []
     def detect(box, kind, target=1024):
         x0, y0, x1, y1 = box
@@ -337,7 +415,7 @@ def detect_face(detector, mp, rgb, label):
     whole = (0, 0, width, height)
     found = detect(whole, 'full_image', max(width, height))
     if not found:
-        found = detect(whole, 'upscaled_full_image', 1600)
+        found = detect(whole, 'rescaled_full_image', 1600)
     if not found:
         # Y-up source upper crops are tried before generic overlapping searches.
         unique = []
@@ -418,18 +496,20 @@ def register_faces(source_lm, photo_lm, source_shape, photo_shape):
     area = abs(float(first[0]*second[1]-first[1]*second[0]))
     if area/eye_span**2 < .25:
         raise FaceTextureError('Outer-eye/chin registration anchors are nearly collinear')
+    # The three fit anchors map exactly; only the remaining landmarks are evidence.
+    diagnostic = [index for index in STABLE if index not in ids]
     affine = np.linalg.solve(np.c_[source_points[ids], np.ones(3)], photo_points[ids])
     singular = np.linalg.svd(affine[:2], compute_uv=False)
     if np.linalg.det(affine[:2]) <= 0 or singular[-1] <= 0 or singular[0]/singular[-1] > 2.5:
         raise FaceTextureError('Registration reverses orientation or stretches the face excessively')
-    mapped = np.c_[source_points[list(STABLE)], np.ones(len(STABLE))] @ affine
-    residual = np.linalg.norm(mapped-photo_points[list(STABLE)], axis=1)
+    mapped = np.c_[source_points[diagnostic], np.ones(len(diagnostic))] @ affine
+    residual = np.linalg.norm(mapped-photo_points[diagnostic], axis=1)
     photo_span = float(np.linalg.norm(photo_points[263]-photo_points[33]))
     rms = float(np.sqrt(np.mean(residual**2)))
     if rms/photo_span > .3:
         raise FaceTextureError('Independent stable landmark residual exceeds 30% of photo eye span')
     return affine, {'kind': 'outer-eye/chin affine; source render pixels to original photo pixels',
-                    'fit_landmark_indices': ids, 'diagnostic_landmark_indices': list(STABLE),
+                    'fit_landmark_indices': ids, 'diagnostic_landmark_indices': diagnostic,
                     'affine_3x2': affine.tolist(), 'linear_singular_values': singular.tolist(),
                     'stable_residual_pixels': residual.tolist(), 'stable_rms_pixels': rms,
                     'stable_rms_photo_eye_fraction': rms/photo_span}
@@ -440,7 +520,6 @@ def _sample(mask, xy, order=1):
 
 
 def select_triangles(source, rendered, source_mask, photo_mask, affine):
-    height, width = source_mask.shape
     yy, xx = np.nonzero((source_mask > .05) & (rendered['owners'] >= 0))
     screen = np.c_[xx+.5, yy+.5]
     photo_xy = np.c_[screen, np.ones(len(screen))] @ affine
@@ -463,53 +542,74 @@ def paint_atlas(source, selected, rendered, source_mask, photo, photo_mask, affi
     atlas = source['atlas'].copy()
     original = source['atlas']
     height, width = atlas.shape[:2]
-    covered = np.zeros((height, width), dtype=bool)
-    strongest = np.zeros((height, width), dtype=np.float32)
     view = rendered['view']
     depth_tolerance = max(float(np.ptp(view['depth']))*1e-5, 1e-8)
-    photo = photo.astype(np.float64)
-    for face in np.flatnonzero(selected):
-        ids = source['triangles'][face]
-        # glTF normalized UVs address centers (i+.5)/N, not corners i/(N-1).
-        tex = source['uv'][ids]*[width, height]-.5
-        raster = _raster_triangle(tex, width, height, 0)
-        if raster is None:
-            continue
-        points, bary = raster
-        if not len(points):
-            continue
-        screen = bary @ view['xy'][ids]
-        z = bary @ view['depth'][ids]
+    faces = np.flatnonzero(selected)
+    ids = source['triangles'][faces]
+    # glTF normalized UVs address centers (i+.5)/N, not corners i/(N-1).
+    tex = source['uv'][ids]*[width, height]-.5
+    xy_tri, z_tri = view['xy'][ids], view['depth'][ids]
+    # Screen-space depth slope per triangle for the subpixel edge depth gate.
+    e1, e2 = xy_tri[:, 1]-xy_tri[:, 0], xy_tri[:, 2]-xy_tri[:, 0]
+    dz1, dz2 = z_tri[:, 1]-z_tri[:, 0], z_tri[:, 2]-z_tri[:, 0]
+    determinant = e1[:, 0]*e2[:, 1] - e1[:, 1]*e2[:, 0]
+    valid = np.abs(determinant) > 1e-12
+    safe = np.where(valid, determinant, 1)
+    slope = np.where(valid, np.abs((dz1*e2[:, 1]-dz2*e1[:, 1])/safe) + np.abs((e1[:, 0]*dz2-e2[:, 0]*dz1)/safe), 0)
+    footprint = np.zeros((height, width), dtype=bool)
+    parts = []
+    for local, points, bary in _raster_batch(tex, width, height, 0):
+        footprint[points[:, 1], points[:, 0]] = True
+        face = faces[local]
+        screen = _interpolate(bary, xy_tri[local])
+        z = _interpolate(bary, z_tri[local])
         px = np.floor(screen[:, 0]).astype(int)
         py = np.floor(screen[:, 1]).astype(int)
         in_frame = (px >= 0) & (py >= 0) & (px < source_mask.shape[1]) & (py < source_mask.shape[0])
-        points, bary, screen, z, px, py = (a[in_frame] for a in (points, bary, screen, z, px, py))
+        local, points, screen, z, px, py, face = (a[in_frame] for a in (local, points, screen, z, px, py, face))
         if not len(points):
             continue
         # Exact triangle ownership is strongest. Subpixel edge samples on an
         # adjacent triangle get a depth gate with the local triangle's slope.
         owner = rendered['owners'][py, px]
         sample_depth = rendered['depth'][py, px]
-        xy_tri = view['xy'][ids]
-        plane = np.linalg.lstsq(np.c_[xy_tri, np.ones(3)], view['depth'][ids], rcond=None)[0]
-        local_tolerance = depth_tolerance + .75*(abs(plane[0])+abs(plane[1]))
+        local_tolerance = depth_tolerance + .75*slope[local]
         visible = (owner == face) | ((owner >= 0) & (np.abs(z-sample_depth) <= local_tolerance))
         photo_xy = np.c_[screen, np.ones(len(screen))] @ affine
         amount = _sample(source_mask, screen) * _sample(photo_mask, photo_xy) * strength
-        keep = visible & (amount > 1e-5) & (amount > strongest[points[:, 1], points[:, 0]])
-        points, amount, photo_xy = points[keep], amount[keep], photo_xy[keep]
-        if not len(points):
-            continue
-        coords = [photo_xy[:, 1]-.5, photo_xy[:, 0]-.5]
-        rgb = np.stack([map_coordinates(photo[:, :, channel], coords, order=1, mode='nearest') for channel in range(3)], axis=1)/source['factor'][:3]
-        old = original[points[:, 1], points[:, 0], :3].astype(float)
-        atlas[points[:, 1], points[:, 0], :3] = np.rint((old*(1-amount[:, None])+rgb*amount[:, None]).clip(0, 255)).astype(np.uint8)
-        strongest[points[:, 1], points[:, 0]] = amount
-        covered[points[:, 1], points[:, 0]] = True
-    if not covered.any():
+        keep = visible & (amount > 1e-5)
+        keys = points[keep, 1]*width + points[keep, 0]
+        best = _winners(keys, amount[keep], face[keep])
+        parts.append((keys[best], amount[keep][best], face[keep][best], photo_xy[keep][best]))
+    if not parts:
         raise FaceTextureError('Face projection covers no visible source atlas texels')
-    distance, nearest = distance_transform_edt(~covered, return_indices=True)
-    gutter = (distance > 0) & (distance <= 4)
+    keys, amount, face, photo_xy = (np.concatenate(column) for column in zip(*parts))
+    best = _winners(keys, amount, face)
+    keys, amount, photo_xy = keys[best], amount[best], photo_xy[best]
+    if not len(keys):
+        raise FaceTextureError('Face projection covers no visible source atlas texels')
+    py, px = np.divmod(keys, width)
+    coords = [photo_xy[:, 1]-.5, photo_xy[:, 0]-.5]
+    photo = photo.astype(np.float64)
+    rgb = np.stack([map_coordinates(photo[:, :, channel], coords, order=1, mode='nearest') for channel in range(3)], axis=1)
+    factor = source['factor'][:3]
+    clipped = np.zeros(len(keys), dtype=bool)
+    if not np.all(factor == 1):
+        # The viewer shows linear(texel) * factor; invert that in linear light.
+        linear = _srgb_to_linear(rgb) / factor
+        clipped = (linear > 1 + 1e-9).any(axis=1)
+        rgb = _linear_to_srgb(np.minimum(linear, 1))
+    old = original[py, px, :3].astype(float)
+    atlas[py, px, :3] = np.rint((old*(1-amount[:, None])+rgb*amount[:, None]).clip(0, 255)).astype(np.uint8)
+    covered = np.zeros((height, width), dtype=bool)
+    covered[py, px] = True
+    # Pad only outside the face triangles' UV footprint, near painted texels.
+    # Inside it, unpainted texels (masked out or occluded) keep their original
+    # values; outside it, padding continues the nearest footprint texel so
+    # bilinear filtering at island edges sees the island's own colors.
+    distance = distance_transform_edt(~covered)
+    gutter = (distance > 0) & (distance <= 4) & ~footprint
+    _, nearest = distance_transform_edt(~footprint, return_indices=True)
     atlas[gutter] = atlas[nearest[0][gutter], nearest[1][gutter]]
     changed = np.any(atlas != original, axis=2)
     if not changed.any():
@@ -519,6 +619,7 @@ def paint_atlas(source, selected, rendered, source_mask, photo, photo_mask, affi
     return output.getvalue(), {'edited_texture_pixels': int(changed.sum()),
                                'painted_texture_pixels': int(covered.sum()),
                                'gutter_pixels': int(gutter.sum()), 'gutter_width_pixels': 4,
+                               'factor_clipped_texture_pixels': int(clipped.sum()),
                                'atlas_size': [width, height],
                                'scalar_base_color_factor': source['factor'].tolist()}
 
@@ -569,7 +670,7 @@ def partition_glb(source, selected, atlas_png):
             + struct.pack('<II', len(payload), 0x004E4942)+payload)
 
 
-def _comparison(photo, before, after, output):
+def _comparison(photo, before, after):
     size = before.shape[0]
     reference = ImageOps.contain(Image.fromarray(photo), (size, size-32))
     canvas = Image.new('RGB', (size*3, size+32), (245, 245, 245))
@@ -579,7 +680,43 @@ def _comparison(photo, before, after, output):
     draw = ImageDraw.Draw(canvas)
     for index, title in enumerate(('Matching reference photo', 'Original mesh albedo', 'Face texture only / same geometry')):
         draw.text((index*size+10, 10), title, fill=(25, 25, 25))
+    output = io.BytesIO()
     canvas.save(output, format='PNG')
+    return output.getvalue()
+
+
+def _material_atlas(doc, binary, material_index):
+    """Decode the base-color atlas and factor a material actually references."""
+    material = _ref(doc, 'materials', material_index)
+    pbr = material['pbrMetallicRoughness']
+    texture = _ref(doc, 'textures', pbr['baseColorTexture']['index'])
+    view = _ref(doc, 'bufferViews', _ref(doc, 'images', texture['source'])['bufferView'])
+    start = int(view.get('byteOffset', 0))
+    with Image.open(io.BytesIO(binary[start:start + int(view['byteLength'])])) as image:
+        atlas = np.array(image.convert('RGBA'))
+    return atlas, pbr.get('baseColorFactor', [1, 1, 1, 1])
+
+
+def _write_outputs(files):
+    """Stage every output beside its target; publish only after all writes succeed."""
+    staged, published = [], []
+    try:
+        for path, data in files:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, name = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
+            staged.append((Path(name), path))
+            with os.fdopen(descriptor, 'wb') as handle:
+                handle.write(data)
+        for temporary, path in staged:
+            os.replace(temporary, path)
+            published.append(path)
+    except BaseException:
+        for path in published:
+            path.unlink(missing_ok=True)
+        raise
+    finally:
+        for temporary, _ in staged:
+            temporary.unlink(missing_ok=True)
 
 
 def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
@@ -637,21 +774,29 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
     affine, registration = register_faces(source_lm, photo_lm, before['rgb'].shape, photo.shape)
     selected = select_triangles(source, before, source_mask, photo_mask, affine)
     atlas_png, pixels = paint_atlas(source, selected, before, source_mask, photo, photo_mask, affine, strength)
-    with Image.open(io.BytesIO(atlas_png)) as image:
-        face_atlas = np.array(image.convert('RGBA'))
-    after = render_albedo(source, view, face_atlas, selected)
     output = partition_glb(source, selected, atlas_png)
     doc, binary = parse_glb(output)
     original_doc = source['gltf']
-    attributes_exact = all(p['attributes'] == source['primitive']['attributes'] for p in doc['meshes'][0]['primitives'])
+    primitives = doc['meshes'][0]['primitives']
+    attributes_exact = all(p['attributes'] == source['primitive']['attributes'] for p in primitives)
     binary_exact = binary[:len(source['binary'])] == source['binary']
-    indices_exact = all(np.array_equal(accessor_array(doc, binary, p['indices']).reshape(-1, 3), source['triangles'][mask])
-                        for p, mask in zip(doc['meshes'][0]['primitives'], (~selected, selected)))
+    emitted = [accessor_array(doc, binary, p['indices']).reshape(-1, 3) for p in primitives]
+    indices_exact = len(emitted) == 2 and all(np.array_equal(tris, source['triangles'][mask])
+                                              for tris, mask in zip(emitted, (~selected, selected)))
     original_images_exact = doc['images'][:len(original_doc['images'])] == original_doc['images'] and binary_exact
     transforms_exact = all(doc.get(key) == original_doc.get(key) for key in ('nodes', 'scenes', 'scene'))
     geometry_unchanged = binary_exact and attributes_exact and indices_exact and transforms_exact
     if not geometry_unchanged or not original_images_exact:
         raise FaceTextureError('Internal append-only export preservation check failed')
+    # Verify the emitted file, not the in-memory intent: decode the atlas each
+    # output primitive's material references and render with those bytes.
+    emitted_atlases = []
+    for primitive in primitives:
+        atlas, factor = _material_atlas(doc, binary, primitive['material'])
+        if not np.array_equal(np.asarray(factor, dtype=float), source['factor']):
+            raise FaceTextureError('Internal export changed the base-color factor')
+        emitted_atlases.append(atlas)
+    after = render_albedo(source, view, atlases=emitted_atlases, assignment=selected.astype(np.int64))
     changed_render = np.any(before['rgb'] != after['rgb'], axis=2)
     if not changed_render.any():
         raise FaceTextureError('The corrected texture has no visible effect in the actual source render')
@@ -659,13 +804,14 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
     protected_changes = int((changed_render & protected).sum())
     if protected_changes:
         raise FaceTextureError('Internal protected-body render isolation check failed')
-    report = {'schema_version': 1, 'status': 'face_texture_only',
+    report = {'schema_version': 2, 'status': 'face_texture_only',
         'method': 'Fresh CPU MediaPipe RGB detection and semantics; orthographic visible-triangle photo projection; append-only private atlas',
         'source_sha256': hashlib.sha256(source['raw']).hexdigest(), 'output_sha256': hashlib.sha256(output).hexdigest(),
-        'reference_sha256': hashlib.sha256(reference_image.read_bytes()).hexdigest(),
+        'reference_file_sha256': hashlib.sha256(reference_image.read_bytes()).hexdigest(),
+        'reference_rgb_sha256': hashlib.sha256(np.asarray(photo.shape, dtype='<u4').tobytes() + photo.tobytes()).hexdigest(),
         'models': {'face_sha256': hashlib.sha256(face_model.read_bytes()).hexdigest(), 'segmenter_sha256': hashlib.sha256(segment_model.read_bytes()).hexdigest()},
         'original_vertex_rows': len(source['positions']), 'original_triangle_count': len(source['triangles']),
-        'output_triangle_count': int((~selected).sum()+selected.sum()), 'selected_triangles': int(selected.sum()),
+        'output_triangle_count': sum(len(tris) for tris in emitted), 'selected_triangles': int(selected.sum()),
         'face_material_triangles': int(selected.sum()), 'original_material_triangles': int((~selected).sum()),
         'geometry_unchanged': bool(geometry_unchanged), 'original_geometry_binary_prefix_exact': binary_exact,
         'all_vertex_attributes_exact': attributes_exact, 'scene_transforms_exact': transforms_exact,
@@ -681,9 +827,7 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
         'limitations': ['Planar affine does not undo photographic perspective or expression differences.',
                         'Landmarks and semantic probabilities are observations, not anatomical reconstruction.',
                         'No vertex positions, UVs, normals, tangents or original image bytes are changed.']}
-    for path in (output_glb, comparison_png, proof_json):
-        path.parent.mkdir(parents=True, exist_ok=True)
-    output_glb.write_bytes(output)
-    _comparison(photo, before['rgb'], after['rgb'], comparison_png)
-    proof_json.write_text(json.dumps(report, indent=2, allow_nan=False)+'\n')
+    _write_outputs([(output_glb, output),
+                    (comparison_png, _comparison(photo, before['rgb'], after['rgb'])),
+                    (proof_json, (json.dumps(report, indent=2, allow_nan=False)+'\n').encode())])
     return report

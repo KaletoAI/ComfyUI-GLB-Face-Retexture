@@ -22,6 +22,21 @@ if WORKER_IMPORT_ERROR is None:
     SPEC.loader.exec_module(core)
 
 
+def srgb_to_linear(value):
+    c = np.asarray(value, dtype=float) / 255
+    return np.where(c <= .04045, c / 12.92, ((c + .055) / 1.055) ** 2.4)
+
+
+def linear_to_srgb(value):
+    v = np.asarray(value, dtype=float)
+    return 255 * np.where(v <= .0031308, v * 12.92, 1.055 * v ** (1 / 2.4) - .055)
+
+
+def texel_for(photo_value, factor):
+    """The texel a glTF viewer turns into `photo_value` after the linear factor."""
+    return int(np.rint(linear_to_srgb(srgb_to_linear(photo_value) / factor)))
+
+
 def fixture(path, change=None):
     """Two separately indexed triangles intentionally share every UV texel."""
     positions = np.array([[-.8, -.8, 1], [.8, -.8, 1], [0, .8, 1],
@@ -98,8 +113,9 @@ class PreservationTests(unittest.TestCase):
             atlas, metrics = core.paint_atlas(source, np.array([True, False]), before, mask, photo, mask, np.array([[1, 0], [0, 1], [0, 0]]), 1)
             self.assertGreater(metrics['edited_texture_pixels'], 0)
             painted = np.asarray(Image.open(io.BytesIO(atlas)))
-            np.testing.assert_array_equal(painted[16, 16, :3], [200, 150, 200])
-            np.testing.assert_array_equal(painted[0, 16, :3], [200, 150, 200])
+            painted_rgb = [texel_for(100, .5), 150, 200]
+            np.testing.assert_array_equal(painted[16, 16, :3], painted_rgb)
+            np.testing.assert_array_equal(painted[0, 16, :3], painted_rgb)
             np.testing.assert_array_equal(painted[31, 0], [20, 40, 60, 255])
             rear_view = core.make_view(source['positions'], 64, 180)
             body_before = core.render_albedo(source, rear_view)['rgb']
@@ -130,7 +146,7 @@ class PreservationTests(unittest.TestCase):
             atlas, _ = core.paint_atlas(source, np.array([True, False]), rendered,
                                        mask, photo, mask, np.array([[1, 0], [0, 1], [0, 0]]), 1)
             painted = np.asarray(Image.open(io.BytesIO(atlas)))
-            np.testing.assert_array_equal(painted[16, 16, :3], [32, 16, 80])
+            np.testing.assert_array_equal(painted[16, 16, :3], [texel_for(16, .5), 16, 80])
 
     def test_depth_gate_refuses_occluded_triangle_even_with_shared_uv(self):
         """Removing the depth test would paint the hidden back/body triangle."""
@@ -144,12 +160,120 @@ class PreservationTests(unittest.TestCase):
             with self.assertRaisesRegex(core.FaceTextureError, 'visible.*texels'):
                 core.paint_atlas(source, np.array([False, True]), rendered, mask, photo, mask, np.array([[1, 0], [0, 1], [0, 0]]), 1)
 
+    def test_base_color_factor_is_inverted_in_linear_light(self):
+        """A glTF viewer must show the photo color, not an sRGB-space approximation."""
+        with tempfile.TemporaryDirectory() as directory:
+            src = Path(directory) / 'source.glb'
+            fixture(src)
+            source = core.read_source(src)
+            view = core.make_view(source['positions'], 64, 0)
+            before = core.render_albedo(source, view)
+            mask = np.ones((64, 64), dtype=np.float32)
+            affine = np.array([[1, 0], [0, 1], [0, 0]])
+            photo = np.full((64, 64, 3), [100, 150, 200], dtype=np.uint8)
+            atlas, metrics = core.paint_atlas(source, np.array([True, False]), before, mask, photo, mask, affine, 1)
+            painted = np.asarray(Image.open(io.BytesIO(atlas)))
+            shown = linear_to_srgb(srgb_to_linear(painted[16, 16, :3]) * source['factor'][:3])
+            np.testing.assert_allclose(shown, [100, 150, 200], atol=1.5)
+            after = core.render_albedo(source, view, painted, np.array([True, False]))['rgb']
+            np.testing.assert_allclose(after[32, 32], [100, 150, 200], atol=1.5)
+            self.assertEqual(metrics['factor_clipped_texture_pixels'], 0)
+            bright = np.full((64, 64, 3), [230, 150, 200], dtype=np.uint8)
+            _, clipped = core.paint_atlas(source, np.array([True, False]), before, mask, bright, mask, affine, 1)
+            self.assertEqual(clipped['factor_clipped_texture_pixels'], clipped['painted_texture_pixels'])
+
+    def test_gutter_never_overwrites_unpainted_face_texels(self):
+        """Masked-out or occluded texels inside face triangles keep their original color."""
+        with tempfile.TemporaryDirectory() as directory:
+            src = Path(directory) / 'source.glb'
+            fixture(src)
+            source = core.read_source(src)
+            view = core.make_view(source['positions'], 64, 0)
+            before = core.render_albedo(source, view)
+            half = np.ones((64, 64), dtype=np.float32)
+            half[:, 32:] = 0
+            photo = np.full((64, 64, 3), [100, 150, 200], dtype=np.uint8)
+            atlas, metrics = core.paint_atlas(source, np.array([True, False]), before, half, photo,
+                                              np.ones((64, 64), dtype=np.float32), np.array([[1, 0], [0, 1], [0, 0]]), 1)
+            painted = np.asarray(Image.open(io.BytesIO(atlas)))
+            after = core.render_albedo(source, view, painted, np.array([True, False]))['rgb']
+            # Mask edge is column 32; bilinear mask and texture filtering reach < 4 pixels.
+            far = before['owners'][:, 36:] == 0
+            np.testing.assert_array_equal(after[:, 36:][far], before['rgb'][:, 36:][far])
+            self.assertGreater(metrics['gutter_pixels'], 0)
+
+    def test_vectorized_render_keeps_nearest_surface_and_first_on_ties(self):
+        """The z buffer keeps the front triangle; equal depth keeps the earlier triangle."""
+        with tempfile.TemporaryDirectory() as directory:
+            src = Path(directory) / 'source.glb'
+            fixture(src)
+            source = core.read_source(src)
+            front = core.render_albedo(source, core.make_view(source['positions'], 64, 0))
+            self.assertEqual(set(np.unique(front['owners'])) - {-1}, {0})
+            rear = core.render_albedo(source, core.make_view(source['positions'], 64, 180))
+            self.assertEqual(set(np.unique(rear['owners'])) - {-1}, {1})
+            flat = dict(source, positions=source['positions'] * [1, 1, 0])
+            tie = core.render_albedo(flat, core.make_view(flat['positions'], 64, 0))
+            self.assertEqual(set(np.unique(tie['owners'])) - {-1}, {0})
+
+    def test_wrap_modes_sample_texture_edges(self):
+        """REPEAT, CLAMP and MIRRORED_REPEAT choose different neighbors at the atlas edge."""
+        atlas = np.zeros((1, 4, 4), dtype=np.uint8)
+        atlas[0, :, 0] = [10, 20, 30, 40]
+        uv = np.array([[0.0, .5]])
+        results = {}
+        for mode in (10497, 33071, 33648):
+            source = {'sampler': {'wrapS': mode, 'wrapT': mode}, 'factor': np.ones(4)}
+            results[mode] = core._texture_rgb(source, uv, atlas)[0, 0]
+        self.assertAlmostEqual(results[10497], 25)
+        self.assertAlmostEqual(results[33071], 10)
+        self.assertAlmostEqual(results[33648], 10)
+        with self.assertRaises(core.FaceTextureError):
+            core._texture_rgb({'sampler': {'wrapS': 1234}, 'factor': np.ones(4)}, uv, atlas)
+
+    def test_registration_residual_excludes_exact_fit_anchors(self):
+        """Exactly fitted anchors must not dilute the independent landmark residual."""
+        rng = np.random.default_rng(7)
+        source = np.c_[rng.uniform(.3, .7, (468, 2)), np.zeros(468)]
+        source[33, :2], source[263, :2], source[152, :2] = (.35, .4), (.65, .4), (.5, .85)
+        independent = [index for index in core.STABLE if index not in (33, 263, 152)]
+        shape = (100, 100, 3)
+        moved = source.copy()
+        moved[independent, 0] += .1  # 10 pixels = 33% of the 30-pixel eye span
+        with self.assertRaisesRegex(core.FaceTextureError, 'residual'):
+            core.register_faces(source, moved, shape, shape)
+        nudged = source.copy()
+        nudged[independent, 0] += .05
+        _, report = core.register_faces(source, nudged, shape, shape)
+        self.assertEqual(report['diagnostic_landmark_indices'], independent)
+        self.assertAlmostEqual(report['stable_rms_pixels'], 5)
+
+    def test_outputs_are_published_only_together(self):
+        """A failing output write must not leave a partial corrected result behind."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            blocked = root / 'proof.json'
+            blocked.mkdir()
+            with self.assertRaises(OSError):
+                core._write_outputs([(root / 'out.glb', b'glb'), (root / 'cmp.png', b'png'), (blocked, b'{}')])
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ['proof.json'])
+            core._write_outputs([(root / 'out.glb', b'glb'), (root / 'cmp.png', b'png')])
+            self.assertEqual((root / 'out.glb').read_bytes(), b'glb')
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ['cmp.png', 'out.glb', 'proof.json'])
+
     def test_unsupported_assets_are_explicitly_rejected(self):
         """Unsupported deformation, compression and external assets must not pass."""
         mutations = [lambda d: d.update(skins=[{}]), lambda d: d.update(animations=[{}]),
                      lambda d: d['images'][0].update(uri='external.png'),
                      lambda d: d['meshes'][0]['primitives'][0].update(extensions={'KHR_draco_mesh_compression': {}}),
-                     lambda d: d['bufferViews'][0].update(extensions={'EXT_meshopt_compression': {}})]
+                     lambda d: d['bufferViews'][0].update(extensions={'EXT_meshopt_compression': {}}),
+                     # Malformed references must fail as FaceTextureError, not KeyError/IndexError.
+                     lambda d: d['meshes'][0]['primitives'][0].pop('attributes'),
+                     lambda d: d['textures'][0].update(sampler=3),
+                     lambda d: d['textures'][0].update(source=-1),
+                     lambda d: d['nodes'][0].update(children=[9]),
+                     lambda d: d['meshes'][0]['primitives'][0].update(indices=-1),
+                     lambda d: d['images'][0].update(bufferView=0)]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'bad.glb'
             for change in mutations:
