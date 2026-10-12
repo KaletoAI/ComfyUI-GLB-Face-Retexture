@@ -1,5 +1,7 @@
 # Install only in this package's isolated Python 3.12 worker venv.
-mediapipe==0.10.21
+# MediaPipe 0.10.21 has no Linux ARM64 wheel; 0.10.18 provides CPython 3.12 aarch64.
+mediapipe==0.10.18; sys_platform == "linux" and platform_machine == "aarch64"
+mediapipe==0.10.21; sys_platform != "linux" or platform_machine != "aarch64"
 numpy==1.26.4
 scipy==1.17.1
 Pillow==12.3.0

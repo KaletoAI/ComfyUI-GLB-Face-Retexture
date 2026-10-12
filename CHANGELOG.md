@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.1 — 2026-10-12
+
+- Fix installation on Linux ARM64: select MediaPipe 0.10.18 only for Linux aarch64 workers, using its official CPython 3.12 wheel; retain 0.10.21 on other platforms.
+- Verify all 14 worker tests on Linux ARM64 and x86-64, plus a real native ComfyUI workflow and AI-Hub upload/result round trip on NVIDIA GB10. Original geometry and protected body texture remain unchanged.
+
 ## 1.0.0 — 2026-10-12
 
 - Extract the face-only GLB texture projection node from AI-Hub into the independent Apache-2.0 package ComfyUI-GLB-Face-Retexture, retaining original attribution.
