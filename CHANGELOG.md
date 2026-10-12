@@ -13,6 +13,7 @@
 - Proof schema 2: render checks use the atlases decoded from the written GLB, `output_triangle_count` is read from the emitted index accessors, and the reference is hashed both as file (`reference_file_sha256`) and as decoded RGB (`reference_rgb_sha256`).
 - Publish GLB, comparison and proof only together, so a late failure leaves no partial result.
 - Extend the suite from 14 to 31 tests, including the ComfyUI bridge and a real CPU MediaPipe end-to-end run on a public-domain portrait fixture.
+- Add a release workflow: pushing a `v*` tag that matches `pyproject.toml` creates the GitHub release from this changelog section.
 
 ## 1.0.1 — 2026-10-12
 

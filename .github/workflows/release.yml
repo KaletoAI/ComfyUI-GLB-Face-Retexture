@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  github-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check tag against pyproject version and extract changelog notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          project=$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml)
+          if [ "$version" != "$project" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match pyproject version $project" >&2
+            exit 1
+          fi
+          awk -v heading="## $version " 'index($0, heading) == 1 {found = 1; print "# Changelog\n"; print; next}
+               found && /^## / {exit} found {print}' CHANGELOG.md > notes.md
+          if [ "$(grep -c . notes.md)" -lt 3 ]; then
+            echo "CHANGELOG.md has no section for $version" >&2
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --title "GLB Face Retexture $VERSION" --notes-file notes.md
