@@ -11,7 +11,7 @@ Geometry is preserved, but the output is **not a byte-identical GLB**: original 
 - A separate **Python 3.12** installation, or [uv](https://docs.astral.sh/uv/getting-started/installation/) on PATH to obtain it. Network access is needed for worker dependencies and official model downloads.
 - Your own supported GLB and matching RGB photo. No source meshes, photos or sample assets are bundled.
 
-The CPU worker runs in a private `.venv` with its own MediaPipe dependencies. It does not install worker dependencies into ComfyUI, use ComfyUI's GPU environment, or silently fall back to the ComfyUI interpreter. Windows installation commands are provided, but Windows execution has not yet been verified.
+The CPU worker runs in a private `.venv` with its own MediaPipe dependencies. It does not install worker dependencies into ComfyUI, use ComfyUI's GPU environment, or silently fall back to the ComfyUI interpreter. The interactive workflow was verified on Linux with ComfyUI 0.37.0, frontend 1.53.6 and Comfy Python 3.13.14. A Windows ComfyUI GUI session has not yet been verified.
 
 ## Install
 
@@ -23,7 +23,7 @@ Use Manager's **Install via Git URL** with:
 https://github.com/KaletoAI/ComfyUI-GLB-Face-Retexture
 ```
 
-Then run the installer below from the installed custom-node directory. Installing the repository alone does not prepare the private worker.
+Prepare the private worker using the installer below if Manager has not already completed that step. A manual Git clone alone does not prepare the worker.
 
 ### Manual installation
 
@@ -92,6 +92,7 @@ Outputs are native **`FILE_3D`** (`corrected_glb`), **`IMAGE`** (`comparison`) a
 
 - A single mesh with one indexed triangle primitive and an embedded, uncompressed opaque texture.
 - Static assets only: no rigs, skinning, morph targets or external assets. Orient the model **Y-up, +Z front**.
+- Start each edit from the original single-primitive GLB. The corrected output contains separate body/face primitives and is not supported as input for another projection pass.
 - One matching RGB reference image, not a batch. A detectable face must be visible in both the source registration view and photo.
 - This is planar photo projection, not 3D face reconstruction. It cannot improve silhouette, add missing geometry, or repair hidden eye anatomy. Perspective and expression differences can remain visible.
 - Registration, masking and texture projection run locally on CPU. There is no cloud generation service and no automatic model regeneration.
@@ -121,7 +122,7 @@ On Windows:
 .venv\Scripts\python.exe -m unittest discover -s tests -t .
 ```
 
-CI installs that environment with Python 3.12 on Ubuntu and Windows and runs the tests there. CI coverage does not by itself establish a verified Windows ComfyUI session.
+Private-worker installation and tests passed in [GitHub CI on Ubuntu and Windows](https://github.com/KaletoAI/ComfyUI-GLB-Face-Retexture/actions/runs/38292162093). The suite has 14 tests; Windows skips the one symlink-creation test that requires additional privileges. This includes actual CPU Face Landmarker execution, but does not establish a verified Windows ComfyUI GUI session.
 
 The intended package ID is **`glb-face-retexture`**, version **1.0.0**. It is **not yet listed in Comfy Registry**; use the GitHub URL installation above. Workflow `cnr_id` metadata records the intended ID, not evidence of registration.
 

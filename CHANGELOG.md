@@ -7,4 +7,5 @@
 - Preserve the original core algorithm and geometry; partition original triangles into body/face primitives for the projected face texture rather than claiming byte-identical GLB output.
 - Provide a portable Python installer for an isolated Python 3.12 CPU worker and hash-checked official model downloads. Keep ComfyUI project dependencies empty.
 - Include an editable seven-node workflow with empty user-upload selectors and no bundled source assets.
-- Add private-worker unit-test CI for Ubuntu and Windows. Windows ComfyUI execution remains unverified; Comfy Registry publication requires the owner's actual publisher identity and API key.
+- Verify private-worker installation and tests in Ubuntu and Windows CI, including CPU vision execution. Verify the editable workflow end-to-end in Linux ComfyUI 0.37.0; Windows ComfyUI GUI execution remains unverified.
+- Comfy Registry publication requires the owner's actual publisher identity and API key; GitHub installation is available independently.
