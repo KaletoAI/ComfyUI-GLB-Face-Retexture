@@ -1,0 +1,31 @@
+name: Private worker tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  worker-tests:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install isolated CPU worker and official models
+        run: python install.py
+      - name: Run private worker unit tests (Linux)
+        if: runner.os == 'Linux'
+        run: .venv/bin/python -m unittest discover -s tests -t .
+      - name: Run private worker unit tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '& .\.venv\Scripts\python.exe -m unittest discover -s tests -t .'

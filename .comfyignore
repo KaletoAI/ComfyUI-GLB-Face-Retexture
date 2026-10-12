@@ -1,0 +1,15 @@
+.git/
+.github/
+.venv/
+models/
+__pycache__/
+**/__pycache__/
+*.pyc
+tests/
+input/
+output/
+temp/
+private/
+private-fixtures/
+.env
+.env.*

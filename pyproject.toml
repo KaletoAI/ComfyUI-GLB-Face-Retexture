@@ -1,0 +1,17 @@
+[project]
+name = "glb-face-retexture"
+version = "1.0.0"
+description = "Face-only photo texture projection for static GLBs in ComfyUI, preserving geometry."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/KaletoAI/ComfyUI-GLB-Face-Retexture"
+Documentation = "https://github.com/KaletoAI/ComfyUI-GLB-Face-Retexture#readme"
+Issues = "https://github.com/KaletoAI/ComfyUI-GLB-Face-Retexture/issues"
+
+[tool.comfy]
+DisplayName = "GLB Face Retexture (Preserve Geometry)"
+requires-comfyui = ">=0.37.0"
