@@ -13,6 +13,8 @@ Geometry is preserved, but the output is **not a byte-identical GLB**: original 
 
 The CPU worker runs in a private `.venv` with its own MediaPipe dependencies. It does not install worker dependencies into ComfyUI, use ComfyUI's GPU environment, or silently fall back to the ComfyUI interpreter. The interactive workflow was verified on Linux with ComfyUI 0.37.0, frontend 1.53.6 and Comfy Python 3.13.14. A Windows ComfyUI GUI session has not yet been verified.
 
+Worker dependency selection uses standard pip platform markers: **Linux ARM64** (`sys_platform == "linux"` and `platform_machine == "aarch64"`) uses **MediaPipe 0.10.18**; all other platforms retain **0.10.21**. Version 0.10.21 has no Linux ARM64 wheel. The [official 0.10.18 PyPI release](https://pypi.org/project/mediapipe/0.10.18/#files) provides a CPython 3.12 `manylinux_2_17_aarch64` wheel; this does not cover musl/Alpine, 32-bit ARM, or Windows ARM64. The private worker and native workflow were also verified on **Linux ARM64 / NVIDIA GB10**, Python 3.12.3, ComfyUI 0.37.0 and frontend 1.53.6: all 14 worker tests pass, and a real photo/GLB run preserves every original triangle and reports zero changed protected-body pixels. ComfyUI's main environment remains separate.
+
 ## Install
 
 ### ComfyUI Manager
