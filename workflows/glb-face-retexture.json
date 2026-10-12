@@ -259,7 +259,7 @@
       ],
       "properties": {
         "cnr_id": "glb-face-retexture",
-        "ver": "1.0.0",
+        "ver": "1.0.2",
         "Node name for S&R": "GLBFaceRetexture"
       },
       "widgets_values": [

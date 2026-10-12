@@ -1,20 +1,37 @@
 """ComfyUI bridge for face-only texture projection on an existing static GLB."""
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 
+import comfy.model_management
 import folder_paths
 import numpy as np
 from PIL import Image
 import torch
 from comfy_api.latest import Types
 
-from .worker_runtime import MODELS, installer_command, worker_environment, worker_python
+from .worker_runtime import MODELS, installer_command, run_worker, worker_environment, worker_python
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
+DEFAULT_TIMEOUT_SECONDS = 1800
+
+
+def worker_timeout() -> float:
+    """Seconds before a stuck worker is killed; GLB_FACE_RETEXTURE_TIMEOUT overrides it."""
+    value = os.environ.get("GLB_FACE_RETEXTURE_TIMEOUT", "").strip()
+    if not value:
+        return DEFAULT_TIMEOUT_SECONDS
+    try:
+        seconds = float(value)
+    except ValueError:
+        seconds = 0
+    if not 0 < seconds < float("inf"):
+        raise ValueError(f"GLB_FACE_RETEXTURE_TIMEOUT must be a positive number of seconds, not {value!r}.")
+    return seconds
 
 
 class GLBFaceRetexture:
@@ -69,21 +86,28 @@ class GLBFaceRetexture:
         comparison_path = work_dir / "comparison.png"
         proof_path = work_dir / "proof.json"
         command = [
-            python, "-E", "-s", str(PACKAGE_DIR / "worker.py"),
+            python, "-E", "-s", "-X", "utf8", str(PACKAGE_DIR / "worker.py"),
             "--source-glb", str(source_path), "--reference-image", str(reference_path),
             "--output-glb", str(output_path), "--comparison-png", str(comparison_path),
             "--proof-json", str(proof_path), "--model-dir", str(model_dir),
             "--strength", str(strength), "--feather", str(feather),
             "--render-resolution", str(render_resolution), "--yaw", str(yaw),
         ]
-        environment = worker_environment()
+        timeout = worker_timeout()
         try:
-            completed = subprocess.run(command, cwd=PACKAGE_DIR, env=environment, capture_output=True, text=True)
+            # Cancelling the prompt in ComfyUI raises here and kills the worker.
+            returncode, stdout, stderr = run_worker(
+                command, cwd=PACKAGE_DIR, env=worker_environment(), log_dir=work_dir, timeout=timeout,
+                check=comfy.model_management.throw_exception_if_processing_interrupted,
+            )
         except OSError as exc:
             raise RuntimeError(f"GLBFaceRetexture could not start the CPU worker ({python}): {exc}. Run: {repair}") from exc
-        if completed.returncode:
-            details = completed.stderr.strip() or completed.stdout.strip() or "Worker produced no error details."
-            raise RuntimeError(f"GLBFaceRetexture CPU worker failed (exit {completed.returncode}):\n{details}")
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"GLBFaceRetexture CPU worker exceeded {timeout:g} s and was stopped. "
+                               "Lower render_resolution or raise GLB_FACE_RETEXTURE_TIMEOUT.") from exc
+        if returncode:
+            details = stderr.strip() or stdout.strip() or "Worker produced no error details."
+            raise RuntimeError(f"GLBFaceRetexture CPU worker failed (exit {returncode}):\n{details}")
         for output in (output_path, comparison_path, proof_path):
             if not output.is_file() or output.stat().st_size == 0:
                 raise RuntimeError(f"GLBFaceRetexture worker did not produce its required output: {output}")
