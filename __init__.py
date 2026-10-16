@@ -47,7 +47,7 @@ class GLBFaceRetexture:
                 "yaw": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 1.0, "tooltip": "Source viewing yaw in degrees for face registration."}),
             },
             "optional": {
-                "light_balance": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Evens out broad brightness between the left and right half of the photo face (side light). Faces are never symmetric — features are kept, only broad light is balanced. 0 = off."}),
+                "light_balance": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Removes the photo's broad shading from the face (side light, darker face edges where the cheeks turn away) so the texture carries skin colour, not light. Features are kept and nothing is mirrored. 0 = off."}),
                 "tone_match": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Pulls the photo face's overall skin colour and brightness toward the mesh's own face skin, so the projection blends into the surrounding texture without a seam. 0 = off."}),
                 "brightness": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.5, "step": 0.05, "tooltip": "Final brightness scale of the photo face before projection. 1 = unchanged."}),
             }

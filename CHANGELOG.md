@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.0 — 2026-10-16
+
+- `light_balance` now removes the photo's broad shading instead of only balancing left against right: a skin-only low pass of the luminance (sigma a quarter eye span) is divided out and replaced by the median skin luminance, refined in three passes. Besides side light this removes the darker cheek sides where the face turns away from the camera, which 1.1 left as a shadow along the projection edge. Features stay and nothing is mirrored. Measured on a generated face view: broad-shading p10/p90 .57 -> .89, left/right .73 -> .96. The proof adds `shading_p10_p90_before/after`.
+
 ## 1.1.1 — 2026-10-16
 
 - Tone match now targets the mesh's own face skin (semantic face mask of the source render) instead of a ring around the face. On generated meshes that ring was mostly the neck under the chin, with baked shadow, and the hairline, with hair roots, so 1.1.0 pulled the face darker and browner than the skin around it. Measured on a generated humanoid: ring median sRGB 170/125/97 against face skin 203/153/136.
