@@ -95,7 +95,7 @@ Open [`workflows/glb-face-retexture.json`](workflows/glb-face-retexture.json) in
 | `brightness` | 1.0 / 0.5–1.5, step 0.05 | Final linear brightness scale before projection. |
 | `yaw` | 0 / −180–180 degrees | Source viewing yaw for face registration; not mesh deformation. |
 
-The optional photo controls run in linear light before projection: broad side-light balance, then skin tone matching, then manual brightness. Light balance keeps asymmetric facial features; tone matching samples semantic skin around the source face, excluding hair, and falls back to the source face when too little surrounding skin is available. The proof records measurements and any fallback; the comparison shows the adjusted photo. Defaults preserve the previous output bytes and proof.
+The optional photo controls run in linear light before projection: broad side-light balance, then skin tone matching, then manual brightness. Light balance keeps asymmetric facial features; tone matching pulls the photo face's linear median colour toward the mesh's own face skin (the semantic face mask of the source render, hair excluded) — the skin the projection blends into. The proof records the measurements; the comparison shows the adjusted photo. Defaults preserve the previous output bytes and proof.
 
 Outputs are native **`FILE_3D`** (`corrected_glb`), **`IMAGE`** (`comparison`) and **`STRING`** (`proof_metrics`). The metrics are also shown as node text and describe geometry/texture preservation observations. They are measured on the exported GLB itself: its materials' embedded atlases are decoded and rendered again, so `protected_body_changed_render_pixels` checks the written file, not the in-memory intent. The corrected GLB can connect directly to native preview and save nodes.
 
@@ -139,6 +139,6 @@ On Windows:
 
 GitHub CI installs the private worker on Ubuntu and Windows and runs the suite there. The suite includes synthetic photo-control tests and byte-identical default regression coverage; Windows skips the one symlink-creation test that requires additional privileges. It covers the ComfyUI bridge with stub Comfy/torch modules and a real CPU MediaPipe run on a public-domain portrait fixture (see [`tests/fixtures/README.md`](tests/fixtures/README.md)), but does not establish a verified Windows ComfyUI GUI session.
 
-The intended package ID is **`glb-face-retexture`**, version **1.1.0**. It is **not yet listed in Comfy Registry**; use the GitHub URL installation above. Workflow `cnr_id` metadata records the intended ID, not evidence of registration.
+The intended package ID is **`glb-face-retexture`**, version **1.1.1**. It is **not yet listed in Comfy Registry**; use the GitHub URL installation above. Workflow `cnr_id` metadata records the intended ID, not evidence of registration.
 
 Before publishing, the owner must obtain the actual Comfy Registry publisher identity, add its real `PublisherId` under `[tool.comfy]` in `pyproject.toml`, obtain the corresponding registry API key, and publish using the [official registry instructions](https://docs.comfy.org/registry/publishing). No publisher identity or credentials are fabricated here, and there is no automatic publishing workflow.
