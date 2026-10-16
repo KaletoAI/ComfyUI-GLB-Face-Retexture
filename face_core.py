@@ -452,24 +452,27 @@ def detect_face(detector, mp, rgb, label):
             'refinement_max_pixels': float(movement.max()), 'nose_lateral_eye_fraction': float(lateral)}
 
 
+def semantic_skin(segmenter, mp, pixels):
+    """Infer body/face skin and hair confidence without a face-oval restriction."""
+    result = segmenter.segment(mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(pixels)))
+    masks = result.confidence_masks
+    if masks is None or len(masks) != 6:
+        raise FaceTextureError('Expected six selfie segmentation classes')
+    skin = np.asarray(masks[2].numpy_view()).copy() + np.asarray(masks[3].numpy_view())
+    hair = np.asarray(masks[1].numpy_view()).copy()
+    if not np.isfinite(skin).all() or not np.isfinite(hair).all():
+        raise FaceTextureError('Nonfinite semantic masks')
+    return skin.astype(np.float32).clip(0, 1), hair.astype(np.float32).clip(0, 1)
+
+
 def semantic_face_mask(segmenter, mp, rgb, landmarks, box, feather):
     height, width = rgb.shape[:2]
-    def infer(pixels):
-        result = segmenter.segment(mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(pixels)))
-        masks = result.confidence_masks
-        if masks is None or len(masks) != 6:
-            raise FaceTextureError('Expected six selfie segmentation classes')
-        skin = np.asarray(masks[2].numpy_view()).copy() + np.asarray(masks[3].numpy_view())
-        hair = np.asarray(masks[1].numpy_view()).copy()
-        if not np.isfinite(skin).all() or not np.isfinite(hair).all():
-            raise FaceTextureError('Nonfinite semantic masks')
-        return skin.astype(np.float32).clip(0, 1), hair.astype(np.float32).clip(0, 1)
-    skin, hair = infer(rgb)
+    skin, hair = semantic_skin(segmenter, mp, rgb)
     skin, hair = _resize(skin, width, height, True), _resize(hair, width, height, True)
     x0, y0, x1, y1 = box
     patch = rgb[y0:y1, x0:x1]
     scale = 1024/max(patch.shape[:2])
-    local_skin, local_hair = infer(_resize(patch, round(patch.shape[1]*scale), round(patch.shape[0]*scale)))
+    local_skin, local_hair = semantic_skin(segmenter, mp, _resize(patch, round(patch.shape[1]*scale), round(patch.shape[0]*scale)))
     skin[y0:y1, x0:x1] = _resize(local_skin, x1-x0, y1-y0, True)
     hair[y0:y1, x0:x1] = _resize(local_hair, x1-x0, y1-y0, True)
     oval = Image.new('L', (width, height))
@@ -487,6 +490,88 @@ def semantic_face_mask(segmenter, mp, rgb, landmarks, box, feather):
                   'usable_face_pixels': int((mask > .25).sum()), 'feather_eye_fraction': float(feather)}
 
 
+def recolor_skin(source, full_render, skin, hair, source_rgb, source_mask,
+                 photo, photo_mask, strength):
+    """Recolour original texels in linear light using a robust rendered skin model.
+
+    Distance is the maximum coordinate deviation in log(R/G), log(B/G),
+    log(luminance), divided by 1.4826*MAD (floors .06, .06, .12 for uniform
+    samples). Chroma separates skin from olive cloth even with broad shading.
+    Redder-than-model deviations count a quarter (the generator's shift is the
+    error), brighter ones a third. Only the colour moves; every texel keeps its
+    luminance. Weight is one through 1.5 spreads, then a smoothstep to zero at
+    3.5; where it is nonzero it is lifted to a 1.5-texel blur against speckles.
+    The linear-RGB median is also recorded. Model and texels both include
+    baseColorFactor; encode back after dividing it out, as in paint_atlas.
+    """
+    if not np.isfinite(strength) or not 0 <= strength <= 1:
+        raise FaceTextureError('skin_recolor must be finite and in [0,1]')
+    original = source['atlas']
+    if not strength:
+        return original, {}
+    region = (skin > .6) & (hair < .1) & (full_render['owners'] >= 0)
+    if not region.any():
+        raise FaceTextureError('Skin recolour requires confident owned mesh skin pixels')
+    if not (source_mask > .5).any() or not (photo_mask > .5).any():
+        raise FaceTextureError('Skin recolour requires usable source and photo skin pixels')
+    samples = _srgb_to_linear(full_render['rgb'])[region]
+    median = np.median(samples, axis=0)
+    def features(linear):
+        safe = np.maximum(linear, 1e-6)
+        return np.stack((np.log(safe[..., 0]/safe[..., 1]),
+                         np.log(safe[..., 2]/safe[..., 1]),
+                         np.log(safe @ np.array([.2126, .7152, .0722]))), axis=-1)
+    sample_features = features(samples)
+    center = np.median(sample_features, axis=0)
+    mad = np.median(np.abs(sample_features-center), axis=0)
+    spread = np.maximum(1.4826*mad, [.06, .06, .12])
+    observed = np.median(_srgb_to_linear(source_rgb)[source_mask > .5], axis=0)
+    target = np.median(_srgb_to_linear(photo)[photo_mask > .5], axis=0)
+    gain = ((target/np.maximum(observed, 1e-6))**strength).clip(.5, 2)
+    factor = source['factor'][:3]
+    linear = _srgb_to_linear(original[..., :3])*factor
+    deviation = (features(linear)-center)/spread
+    # Generators shift skin toward red, so texels REDDER than the model are the
+    # error itself: they get a four times wider tolerance on that side, while
+    # less red texels (olive cloth, blond hair) keep the tight one.
+    deviation[..., 0] = np.where(deviation[..., 0] > 0, deviation[..., 0]/4, deviation[..., 0])
+    # Brighter skin (baked highlights on a scalp or forehead) is still skin;
+    # darker texels keep the tight tolerance (dark leather, shadows in cloth).
+    deviation[..., 2] = np.where(deviation[..., 2] > 0, deviation[..., 2]/3, deviation[..., 2])
+    distance = np.max(np.abs(deviation), axis=2)
+    t = ((distance-1.5)/2).clip(0, 1)
+    weight = 1-t*t*(3-2*t)
+    # Texels near the threshold would stay half recoloured and show as
+    # speckles; a light blur lifts them to their neighbourhood. It never
+    # spreads into texels the model rejected outright (cloth, hair stay exact).
+    weight = np.where(weight > 0, np.maximum(weight, gaussian_filter(weight, 1.5)), 0)
+    if original.shape[2] == 4:
+        weight[original[..., 3] < 255] = 0
+    atlas = original.copy()
+    # Colour only: each texel keeps its own luminance. A plain per-channel gain
+    # (up to x1.8 on green for a strongly red mesh) pushed bright orange texels
+    # into clipping and left white blotches.
+    luminance = np.array([.2126, .7152, .0722])
+    shifted = linear*(1+(gain-1)*weight[..., None])
+    shifted *= ((linear @ luminance)/np.maximum(shifted @ luminance, 1e-6))[..., None]
+    changed = shifted/factor
+    encoded = np.rint(_linear_to_srgb(changed).clip(0, 255)).astype(np.uint8)
+    active = weight > 0
+    atlas[active, :3] = encoded[active]
+    report = dict(strength=float(strength), gain_rgb=gain.tolist(),
+        mesh_skin_median_srgb=_linear_to_srgb(observed).tolist(),
+        photo_skin_median_srgb=_linear_to_srgb(target).tolist(),
+        model=dict(space='log(R/G), log(B/G), log(linear luminance); including baseColorFactor',
+                   median_rgb_linear=median.tolist(), center=center.tolist(), mad=mad.tolist(),
+                   spread=spread.tolist(), spread_scale=1.4826, spread_floor=[.06, .06, .12],
+                   distance='maximum absolute coordinate deviation / spread',
+                   weight='1 through 1.5 spreads, smoothstep to 0 at 3.5; redder side x1/4, brighter x1/3; lifted to a 1.5-texel blur where nonzero; colour only, luminance kept',
+                   skin_threshold=.6, hair_threshold=.1, pixels=int(region.sum())),
+        texels_weighted=int((weight > .5).sum()),
+        texels_changed=int(np.any(atlas != original, axis=2).sum()), mean_weight=float(weight.mean()))
+    return atlas, report
+
+
 def _validate_photo_controls(light_balance, tone_match, brightness):
     for name, value, low, high in (('light_balance', light_balance, 0, 1),
                                   ('tone_match', tone_match, 0, 1), ('brightness', brightness, .5, 1.5)):
@@ -495,7 +580,7 @@ def _validate_photo_controls(light_balance, tone_match, brightness):
 
 
 def adjust_photo(photo, photo_mask, photo_lm, light_balance=0., tone_match=0., brightness=1.,
-                 source_rgb=None, source_mask=None):
+                 source_rgb=None, source_mask=None, source_skin_gain=None):
     """Balance broad illumination, match rendered skin, then scale in linear light.
 
     The default path deliberately does not decode/re-encode any photo pixels.
@@ -567,6 +652,8 @@ def adjust_photo(photo, photo_mask, photo_lm, light_balance=0., tone_match=0., b
         if not region.any() or not (photo_mask > .5).any():
             raise FaceTextureError('Tone match requires usable source and photo skin pixels')
         target = np.median(_srgb_to_linear(source_rgb).astype(np.float32)[region], axis=0)
+        if source_skin_gain is not None:
+            target *= source_skin_gain
         observed = np.median(linear[photo_mask > .5], axis=0)
         gain = (target/np.maximum(observed, 1e-6))**tone_match
         gain = gain.clip(.5, 2).astype(np.float32)
@@ -719,7 +806,7 @@ def paint_atlas(source, selected, rendered, source_mask, photo, photo_mask, affi
                                'scalar_base_color_factor': source['factor'].tolist()}
 
 
-def partition_glb(source, selected, atlas_png):
+def partition_glb(source, selected, atlas_png, body_atlas_png=None):
     selected = np.asarray(selected, dtype=bool)
     if selected.shape != (len(source['triangles']),) or not selected.any() or selected.all():
         raise FaceTextureError('Expected a nonempty proper face triangle partition')
@@ -754,6 +841,19 @@ def partition_glb(source, selected, atlas_png):
     body['indices'] = index_accessor(source['triangles'][~selected])
     face['indices'] = index_accessor(source['triangles'][selected])
     face['material'] = material_index
+    if body_atlas_png is not None:
+        image_index = len(doc['images'])
+        doc['images'].append({'name': 'Recoloured original skin atlas', 'mimeType': 'image/png',
+                              'bufferView': blob(body_atlas_png)})
+        texture = copy.deepcopy(source['texture'])
+        texture['source'] = image_index
+        texture_index = len(doc['textures'])
+        doc['textures'].append(texture)
+        material = copy.deepcopy(source['material'])
+        material['name'] = 'Recoloured skin; unchanged original geometry'
+        material['pbrMetallicRoughness']['baseColorTexture']['index'] = texture_index
+        body['material'] = len(doc['materials'])
+        doc['materials'].append(material)
     doc['meshes'][0]['primitives'] = [body, face]
     doc['buffers'][0]['byteLength'] = len(binary)
     encoded = json.dumps(doc, separators=(',', ':'), allow_nan=False).encode()
@@ -765,7 +865,7 @@ def partition_glb(source, selected, atlas_png):
             + struct.pack('<II', len(payload), 0x004E4942)+payload)
 
 
-def _comparison(photo, before, after, adjusted=False):
+def _comparison(photo, before, after, adjusted=False, recoloured=False):
     size = before.shape[0]
     reference = ImageOps.contain(Image.fromarray(np.rint(photo).clip(0, 255).astype(np.uint8)), (size, size-32))
     canvas = Image.new('RGB', (size*3, size+32), (245, 245, 245))
@@ -773,7 +873,7 @@ def _comparison(photo, before, after, adjusted=False):
     canvas.paste(Image.fromarray(before), (size, 32))
     canvas.paste(Image.fromarray(after), (size*2, 32))
     draw = ImageDraw.Draw(canvas)
-    for index, title in enumerate(('Matching reference photo' + (' (adjusted)' if adjusted else ''), 'Original mesh albedo', 'Face texture only / same geometry')):
+    for index, title in enumerate(('Matching reference photo' + (' (adjusted)' if adjusted else ''), 'Original mesh albedo', 'Face texture only / same geometry' + (' (recoloured)' if recoloured else ''))):
         draw.text((index*size+10, 10), title, fill=(25, 25, 25))
     output = io.BytesIO()
     canvas.save(output, format='PNG')
@@ -818,9 +918,11 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
                   comparison_png: Path, proof_json: Path, model_dir: Path,
                   strength: float = 1.0, feather: float = .18,
                   render_resolution: int = 768, yaw: float = 0.0,
-                  light_balance: float = 0.0, tone_match: float = 0.0, brightness: float = 1.0) -> dict:
+                  light_balance: float = 0.0, tone_match: float = 0.0, brightness: float = 1.0, skin_recolor: float = 0.0) -> dict:
     """Observe, register, paint and append a private face texture; never deform."""
     _validate_photo_controls(light_balance, tone_match, brightness)
+    if not np.isfinite(skin_recolor) or not 0 <= skin_recolor <= 1:
+        raise FaceTextureError('skin_recolor must be finite and in [0,1]')
     if not np.isfinite([strength, feather, yaw]).all() or not 0 < strength <= 1 or not 0 <= feather <= 1 or not -180 <= yaw <= 180:
         raise FaceTextureError('Strength must be (0,1], feather [0,1], yaw [-180,180] degrees')
     if not isinstance(render_resolution, int) or not 256 <= render_resolution <= 2048:
@@ -869,12 +971,28 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
     with vision.ImageSegmenter.create_from_options(segment_options) as segmenter:
         source_mask, source_semantics = semantic_face_mask(segmenter, mp, before['rgb'], source_lm, source_box, feather)
         photo_mask, photo_semantics = semantic_face_mask(segmenter, mp, photo, photo_lm, photo_box, feather)
+        if skin_recolor:
+            full_skin, full_hair = semantic_skin(segmenter, mp, full_render['rgb'])
+            full_skin = _resize(full_skin, render_resolution, render_resolution, True)
+            full_hair = _resize(full_hair, render_resolution, render_resolution, True)
+    body_atlas_png, skin_report = None, {}
+    expected_body = before
+    paint_source = source
+    if skin_recolor:
+        balanced_photo, _ = adjust_photo(photo, photo_mask, photo_lm, light_balance=light_balance)
+        body_atlas, skin_report = recolor_skin(source, full_render, full_skin, full_hair,
+            before['rgb'], source_mask, balanced_photo, photo_mask, skin_recolor)
+        buffer = io.BytesIO()
+        Image.fromarray(body_atlas).save(buffer, format='PNG')
+        body_atlas_png = buffer.getvalue()
+        paint_source = dict(source, atlas=body_atlas)
+        expected_body = render_albedo(paint_source, view)
     photo, photo_adjust = adjust_photo(photo, photo_mask, photo_lm, light_balance, tone_match, brightness,
-        before['rgb'], source_mask)
+        before['rgb'], source_mask, source_skin_gain=skin_report.get('gain_rgb'))
     affine, registration = register_faces(source_lm, photo_lm, before['rgb'].shape, photo.shape)
     selected = select_triangles(source, before, source_mask, photo_mask, affine)
-    atlas_png, pixels = paint_atlas(source, selected, before, source_mask, photo, photo_mask, affine, strength)
-    output = partition_glb(source, selected, atlas_png)
+    atlas_png, pixels = paint_atlas(paint_source, selected, before, source_mask, photo, photo_mask, affine, strength)
+    output = partition_glb(source, selected, atlas_png, body_atlas_png=body_atlas_png)
     doc, binary = parse_glb(output)
     original_doc = source['gltf']
     primitives = doc['meshes'][0]['primitives']
@@ -901,7 +1019,7 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
     if not changed_render.any():
         raise FaceTextureError('The corrected texture has no visible effect in the actual source render')
     protected = (before['owners'] >= 0) & ~selected[np.maximum(before['owners'], 0)]
-    protected_changes = int((changed_render & protected).sum())
+    protected_changes = int((np.any(expected_body['rgb'] != after['rgb'], axis=2) & protected).sum())
     if protected_changes:
         raise FaceTextureError('Internal protected-body render isolation check failed')
     report = {'schema_version': 2, 'status': 'face_texture_only',
@@ -927,9 +1045,11 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
         'limitations': ['Planar affine does not undo photographic perspective or expression differences.',
                         'Landmarks and semantic probabilities are observations, not anatomical reconstruction.',
                         'No vertex positions, UVs, normals, tangents or original image bytes are changed.']}
+    if skin_report:
+        report['skin_recolor'] = skin_report
     if photo_adjust:
         report['photo_adjust'] = photo_adjust
     _write_outputs([(output_glb, output),
-                    (comparison_png, _comparison(photo, before['rgb'], after['rgb'], adjusted=bool(photo_adjust))),
+                    (comparison_png, _comparison(photo, before['rgb'], after['rgb'], adjusted=bool(photo_adjust), recoloured=bool(skin_recolor))),
                     (proof_json, (json.dumps(report, indent=2, allow_nan=False)+'\n').encode())])
     return report

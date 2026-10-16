@@ -102,17 +102,17 @@ class PhotoAdjustTests(unittest.TestCase):
         arguments = ['worker.py']
         for flag in ('source-glb','reference-image','output-glb','comparison-png','proof-json','model-dir'):
             arguments += ['--'+flag, '/tmp/unused']
-        arguments += ['--light-balance', '.4', '--tone-match', '.6', '--brightness', '.8']
+        arguments += ['--light-balance', '.4', '--tone-match', '.6', '--brightness', '.8', '--skin-recolor', '.7']
         with patch.object(sys, 'argv', arguments), patch.object(worker, 'worker_python'), \
                 patch.object(worker, 'validate_worker_identity'), patch.dict(sys.modules, {'face_core': fake_core}):
             self.assertEqual(worker.main(), 0)
-        self.assertEqual([captured[key] for key in ('light_balance','tone_match','brightness')], [.4,.6,.8])
+        self.assertEqual([captured[key] for key in ('light_balance','tone_match','brightness','skin_recolor')], [.4,.6,.8,.7])
 
     def test_brightness_and_validation(self):
         photo, mask, lm, _, _ = synthetic()
         adjusted, _ = core.adjust_photo(photo, mask, lm, brightness=.5)
         np.testing.assert_allclose(core._srgb_to_linear(adjusted), core._srgb_to_linear(photo)*.5, rtol=1e-5)
-        for name, values in [('light_balance', [-.1,1.1,float('nan')]), ('tone_match', [-.1,1.1,float('inf')]), ('brightness',[.49,1.51,float('nan')])]:
+        for name, values in [('light_balance', [-.1,1.1,float('nan')]), ('tone_match', [-.1,1.1,float('inf')]), ('brightness',[.49,1.51,float('nan')]), ('skin_recolor',[-.1,1.1,float('nan'),float('inf')])]:
             for value in values:
                 with self.subTest(name=name,value=value), self.assertRaisesRegex(core.FaceTextureError, name):
                     core.run_retexture(None,None,None,None,None,None, **{name:value})

@@ -50,6 +50,7 @@ class GLBFaceRetexture:
                 "light_balance": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Removes the photo's broad shading from the face (side light, darker face edges where the cheeks turn away) so the texture carries skin colour, not light. Features are kept and nothing is mirrored. 0 = off."}),
                 "tone_match": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Pulls the photo face's overall skin colour and brightness toward the mesh's own face skin, so the projection blends into the surrounding texture without a seam. 0 = off."}),
                 "brightness": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.5, "step": 0.05, "tooltip": "Final brightness scale of the photo face before projection. 1 = unchanged."}),
+                "skin_recolor": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Recolours the mesh's own skin (face, neck, arms, hands — every skin-coloured texel of the original texture) toward the photo's skin tone, for meshes whose generator shifted the skin colour. Clothes and hair are left alone. 0 = off."}),
             }
         }
 
@@ -59,7 +60,7 @@ class GLBFaceRetexture:
     CATEGORY = "3d/texture"
     DESCRIPTION = "Project a matching photo onto only the visible face texture; preserve the source GLB geometry and original assets. CPU worker runs in a separate process."
 
-    def retexture(self, source_glb, reference_image, strength, feather, render_resolution, yaw, light_balance=0.0, tone_match=0.0, brightness=1.0):
+    def retexture(self, source_glb, reference_image, strength, feather, render_resolution, yaw, light_balance=0.0, tone_match=0.0, brightness=1.0, skin_recolor=0.0):
         repair = installer_command(PACKAGE_DIR)
         if not isinstance(source_glb, Types.File3D) or source_glb.format != "glb":
             raise ValueError("GLBFaceRetexture requires a static textured GLB from the native Load 3D node.")
@@ -98,6 +99,7 @@ class GLBFaceRetexture:
             "--strength", str(strength), "--feather", str(feather),
             "--render-resolution", str(render_resolution), "--yaw", str(yaw),
             "--light-balance", str(light_balance), "--tone-match", str(tone_match), "--brightness", str(brightness),
+            "--skin-recolor", str(skin_recolor),
         ]
         timeout = worker_timeout()
         try:

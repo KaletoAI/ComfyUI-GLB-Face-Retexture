@@ -58,13 +58,20 @@ class VisionInputTests(unittest.TestCase):
             # Explicit defaults must retain GLB, comparison and proof bytes.
             expected = [path.read_bytes() for path in outputs]
             core.run_retexture(source, root / "reference.png", *outputs, MODEL_DIR, render_resolution=256,
-                               light_balance=0, tone_match=0, brightness=1)
+                               light_balance=0, tone_match=0, brightness=1, skin_recolor=0)
             self.assertEqual(expected, [path.read_bytes() for path in outputs])
             # Exercise the real semantic ring and all active controls as well.
             active = core.run_retexture(source, root / "reference.png", root / "active.glb",
                 root / "active.png", root / "active.json", MODEL_DIR, render_resolution=256,
-                light_balance=.5, tone_match=.5, brightness=.9)
+                light_balance=.5, tone_match=.5, brightness=.9, skin_recolor=1)
             self.assertIn("tone", active["photo_adjust"])
+            self.assertTrue(active['geometry_unchanged'])
+            self.assertTrue(active['original_embedded_images_exact'])
+            self.assertEqual(active['protected_body_changed_render_pixels'], 0)
+            self.assertGreater(active['skin_recolor']['texels_changed'], 0)
+            recolor = active['skin_recolor']
+            expected_tone = core._srgb_to_linear(recolor['mesh_skin_median_srgb'])*recolor['gain_rgb']
+            np.testing.assert_allclose(active['photo_adjust']['tone']['target_rgb_linear'], expected_tone, rtol=1e-6)
             self.assertEqual(active["reference_rgb_sha256"], report["reference_rgb_sha256"])
             self.assertEqual(source.read_bytes(), original)
             proof = json.loads(outputs[2].read_text())

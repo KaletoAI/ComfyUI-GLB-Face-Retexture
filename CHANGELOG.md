@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0 — 2026-10-16
+
+- Add optional `skin_recolor` (0–1, default 0) to the node, worker CLI and workflow to correct generator-shifted skin across the original atlas toward the light-balanced photo skin tone in linear light.
+- Model full-front mesh skin with robust colour statistics, softly weight skin-coloured texels (tolerant toward redder and brighter, so the red shift and baked highlights are included), exclude partial alpha, and respect `baseColorFactor`. Only the colour moves; each texel keeps its luminance. On a strongly red generated mesh the plain per-channel gain had clipped scalp highlights into white blotches. Blend the face into the recoloured atlas and tone-match toward the recoloured face skin.
+- Append a separate recoloured body atlas/material while preserving original images, binary prefix and geometry; verify protected body pixels against the expected recolour and record measurements in `skin_recolor`.
+- Retain byte-identical v1.2.0 outputs with recolour off; extend synthetic, export, validation, CLI, bridge and real vision regression coverage.
+
 ## 1.2.0 — 2026-10-16
 
 - `light_balance` now removes the photo's broad shading instead of only balancing left against right: a skin-only low pass of the luminance (sigma a quarter eye span) is divided out and replaced by the median skin luminance, refined in three passes. Besides side light this removes the darker cheek sides where the face turns away from the camera, which 1.1 left as a shadow along the projection edge. Features stay and nothing is mirrored. Measured on a generated face view: broad-shading p10/p90 .57 -> .89, left/right .73 -> .96. The proof adds `shading_p10_p90_before/after`.

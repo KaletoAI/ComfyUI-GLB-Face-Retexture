@@ -121,7 +121,7 @@ class BridgeTests(unittest.TestCase):
 
     def test_optional_controls_forwarded_and_workflow_order(self):
         schema = self.bridge.GLBFaceRetexture.INPUT_TYPES()
-        controls = dict(light_balance=.5, tone_match=.75, brightness=.9)
+        controls = dict(light_balance=.5, tone_match=.75, brightness=.9, skin_recolor=.6)
         self.assertEqual(list(schema["optional"]), list(controls))
         def worker(command, **kwargs):
             for name, value in controls.items():
