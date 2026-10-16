@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.1 — 2026-10-16
+
+- Tone match now targets the mesh's own face skin (semantic face mask of the source render) instead of a ring around the face. On generated meshes that ring was mostly the neck under the chin, with baked shadow, and the hairline, with hair roots, so 1.1.0 pulled the face darker and browner than the skin around it. Measured on a generated humanoid: ring median sRGB 170/125/97 against face skin 203/153/136.
+
 ## 1.1.0 — 2026-10-16
 
 - Add optional `light_balance`, `tone_match` and `brightness` controls to the node and CPU worker CLI; defaults retain byte-identical output and proof.

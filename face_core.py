@@ -452,7 +452,7 @@ def detect_face(detector, mp, rgb, label):
             'refinement_max_pixels': float(movement.max()), 'nose_lateral_eye_fraction': float(lateral)}
 
 
-def semantic_face_mask(segmenter, mp, rgb, landmarks, box, feather, return_maps=False):
+def semantic_face_mask(segmenter, mp, rgb, landmarks, box, feather):
     height, width = rgb.shape[:2]
     def infer(pixels):
         result = segmenter.segment(mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(pixels)))
@@ -483,10 +483,8 @@ def semantic_face_mask(segmenter, mp, rgb, landmarks, box, feather, return_maps=
     mask = (oval_weight*semantic).astype(np.float32)
     if (mask > .25).sum() < 16:
         raise FaceTextureError('Face semantics contain no usable skin region')
-    result = mask, {'skin_classes': [2, 3], 'hair_class': 1, 'face_oval_landmarks': list(FACE_OVAL),
+    return mask, {'skin_classes': [2, 3], 'hair_class': 1, 'face_oval_landmarks': list(FACE_OVAL),
                   'usable_face_pixels': int((mask > .25).sum()), 'feather_eye_fraction': float(feather)}
-
-    return (*result, {'skin': skin, 'hair': hair}) if return_maps else result
 
 
 def _validate_photo_controls(light_balance, tone_match, brightness):
@@ -496,16 +494,8 @@ def _validate_photo_controls(light_balance, tone_match, brightness):
             raise FaceTextureError(f'{name} must be finite and in [{low:g},{high:g}]')
 
 
-def _oval_region(landmarks, shape):
-    height, width = shape
-    oval = Image.new('L', (width, height))
-    polygon = landmarks[list(FACE_OVAL), :2]*[width, height]
-    ImageDraw.Draw(oval).polygon([tuple(p) for p in polygon], fill=255)
-    return np.asarray(oval) > 0
-
-
 def adjust_photo(photo, photo_mask, photo_lm, light_balance=0., tone_match=0., brightness=1.,
-                 source_rgb=None, source_mask=None, source_lm=None, source_box=None, source_maps=None):
+                 source_rgb=None, source_mask=None):
     """Balance broad illumination, match rendered skin, then scale in linear light.
 
     The default path deliberately does not decode/re-encode any photo pixels.
@@ -557,18 +547,11 @@ def adjust_photo(photo, photo_mask, photo_lm, light_balance=0., tone_match=0., b
         linear *= gain[..., None]
         report['cheek_ratio_after'] = ratio(lowpass(linear))
     if tone_match:
-        sh, sw = source_mask.shape
-        oval = _oval_region(source_lm, (sh, sw))
-        distance = distance_transform_edt(~oval)
-        span = np.linalg.norm((source_lm[263, :2]-source_lm[33, :2])*[sw, sh])
-        yy, xx = np.mgrid[:sh, :sw]
-        x0, y0, x1, y1 = source_box
-        region = ((distance > .15*span) & (distance <= .8*span)
-                  & (xx >= x0) & (xx < x1) & (yy >= y0) & (yy < y1)
-                  & (source_maps['skin'] > .5) & (source_maps['hair'] < .1))
-        kind = 'ring'
-        if region.sum() < 200:
-            region, kind = source_mask > .5, 'source_face'
+        # Target = the mesh's own face skin, i.e. exactly the skin the projected
+        # face blends into. A ring around the face measured the wrong thing: on
+        # generated meshes it is mostly the neck under the chin (baked shadow)
+        # and the hairline (hair roots), both far darker than the face skin.
+        region = source_mask > .5
         if not region.any() or not (photo_mask > .5).any():
             raise FaceTextureError('Tone match requires usable source and photo skin pixels')
         target = np.median(_srgb_to_linear(source_rgb).astype(np.float32)[region], axis=0)
@@ -577,7 +560,7 @@ def adjust_photo(photo, photo_mask, photo_lm, light_balance=0., tone_match=0., b
         gain = gain.clip(.5, 2).astype(np.float32)
         linear *= gain
         report['tone'] = dict(target_rgb_linear=target.tolist(), photo_rgb_linear_before=observed.tolist(),
-                              gain_rgb=gain.tolist(), target_region=kind, target_pixels=int(region.sum()))
+                              gain_rgb=gain.tolist(), target_region='source_face', target_pixels=int(region.sum()))
     linear = np.clip(linear*brightness, 0, 1)
     adjusted = _linear_to_srgb(linear).astype(np.float32)
     # Balance alone must leave every pixel outside its valid region byte-exact.
@@ -871,12 +854,10 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
     segment_options = vision.ImageSegmenterOptions(base_options=base(segment_model), running_mode=vision.RunningMode.IMAGE,
                                                    output_confidence_masks=True, output_category_mask=False)
     with vision.ImageSegmenter.create_from_options(segment_options) as segmenter:
-        source_result = semantic_face_mask(segmenter, mp, before['rgb'], source_lm, source_box, feather, return_maps=bool(tone_match))
-        source_mask, source_semantics = source_result[:2]
-        source_maps = source_result[2] if tone_match else None
+        source_mask, source_semantics = semantic_face_mask(segmenter, mp, before['rgb'], source_lm, source_box, feather)
         photo_mask, photo_semantics = semantic_face_mask(segmenter, mp, photo, photo_lm, photo_box, feather)
     photo, photo_adjust = adjust_photo(photo, photo_mask, photo_lm, light_balance, tone_match, brightness,
-        before['rgb'], source_mask, source_lm, source_box, source_maps)
+        before['rgb'], source_mask)
     affine, registration = register_faces(source_lm, photo_lm, before['rgb'].shape, photo.shape)
     selected = select_triangles(source, before, source_mask, photo_mask, affine)
     atlas_png, pixels = paint_atlas(source, selected, before, source_mask, photo, photo_mask, affine, strength)

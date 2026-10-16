@@ -52,27 +52,24 @@ class PhotoAdjustTests(unittest.TestCase):
         self.assertLess(abs(results[1]-np.sqrt(results[0])), .03)
         print('synthetic cheek L/R (off, half, full):', results)
 
-    def test_tone_ring_half_and_fallback(self):
+    def test_tone_matches_source_face_skin(self):
+        """Target = median of the mesh's own face skin (source_mask > .5); the
+        darker neck/hairline around it (here: everything outside the mask) must
+        not pull the tone. tone t gives photo**(1-t) * target**t per channel."""
         photo, mask, lm, _, _ = synthetic()
         photo[:] = core._linear_to_srgb(np.array([.2,.25,.3]))
-        target = np.full_like(photo, core._linear_to_srgb(np.array([.3,.3,.24])))
-        target[core._oval_region(lm, mask.shape)] = core._linear_to_srgb(np.array([.1,.12,.15]))
-        maps = {'skin': np.ones_like(mask), 'hair': np.zeros_like(mask)}
-        # A non-skin corner and hair strip must never contaminate ring statistics.
-        target[:45] = 255
-        maps['hair'][:45] = 1
+        target = np.full_like(photo, core._linear_to_srgb(np.array([.05,.04,.03])))
+        target[mask > .5] = core._linear_to_srgb(np.array([.3,.3,.24]))
         for strength in (.5, 1):
             adjusted, report = core.adjust_photo(photo, mask, lm, tone_match=strength,
-                source_rgb=target, source_mask=mask, source_lm=lm, source_box=(0,0,256,256), source_maps=maps)
+                source_rgb=target, source_mask=mask)
             median = np.median(core._srgb_to_linear(adjusted)[mask>.5], axis=0)
             expected = np.array([.2,.25,.3])**(1-strength)*np.array([.3,.3,.24])**strength
             np.testing.assert_allclose(median, expected, rtol=.03)
-            self.assertEqual(report['tone']['target_region'], 'ring')
+            self.assertEqual(report['tone']['target_region'], 'source_face')
             print('synthetic tone', strength, median.tolist())
-        maps['skin'][:] = 0
-        _, report = core.adjust_photo(photo, mask, lm, tone_match=1, source_rgb=target,
-            source_mask=mask, source_lm=lm, source_box=(0,0,256,256), source_maps=maps)
-        self.assertEqual(report['tone']['target_region'], 'source_face')
+        with self.assertRaises(core.FaceTextureError):
+            core.adjust_photo(photo, mask, lm, tone_match=1, source_rgb=target, source_mask=np.zeros_like(mask))
 
     def test_worker_cli_passes_controls(self):
         import sys

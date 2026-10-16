@@ -48,7 +48,7 @@ class GLBFaceRetexture:
             },
             "optional": {
                 "light_balance": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Evens out broad brightness between the left and right half of the photo face (side light). Faces are never symmetric — features are kept, only broad light is balanced. 0 = off."}),
-                "tone_match": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Pulls the photo face's overall skin colour and brightness toward the mesh's existing skin around the face, so it blends into neck and forehead. 0 = off."}),
+                "tone_match": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Pulls the photo face's overall skin colour and brightness toward the mesh's own face skin, so the projection blends into the surrounding texture without a seam. 0 = off."}),
                 "brightness": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.5, "step": 0.05, "tooltip": "Final brightness scale of the photo face before projection. 1 = unchanged."}),
             }
         }
