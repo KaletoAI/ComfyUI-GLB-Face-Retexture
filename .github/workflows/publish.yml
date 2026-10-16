@@ -1,0 +1,22 @@
+name: Publish to Comfy Registry
+
+# Publishes the version in pyproject.toml whenever a release tag is pushed
+# (the same tags release.yml turns into GitHub releases), or on demand.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish custom node
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'KaletoAI' }}
+    steps:
+      - name: Publish to the Comfy Registry
+        uses: Comfy-Org/publish-node-action@1.0.1
+        with:
+          personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
