@@ -508,44 +508,56 @@ def adjust_photo(photo, photo_mask, photo_lm, light_balance=0., tone_match=0., b
     report = dict(light_balance=float(light_balance), tone_match=float(tone_match), brightness=float(brightness))
     height, width = photo.shape[:2]
     if light_balance:
-        points = photo_lm[[10, 168, 6, 1, 0, 13, 14, 152], :2]*[width, height]
-        a, b = np.linalg.lstsq(np.c_[points[:, 1], np.ones(len(points))], points[:, 0], rcond=None)[0]
-        residual = np.sqrt(np.mean((points[:, 0]-a*points[:, 1]-b)**2))
-        region = photo_mask > .25
+        # Delighting: the projected photo must carry albedo, not its own light —
+        # the 3D renderer shades the face again. Broad shading (side light, and
+        # the darker cheek sides where the face turns away from the camera, which
+        # reads as a shadow along the projection edge) is divided out of a
+        # skin-only low pass and replaced by the median skin luminance. Features
+        # are far smaller than the low pass and survive; nothing is mirrored, so
+        # an asymmetric face stays asymmetric.
+        region = photo_mask > .5
+        if not region.any():
+            raise FaceTextureError('Light balance requires usable photo skin pixels')
         span = np.linalg.norm((photo_lm[263, :2]-photo_lm[33, :2])*[width, height])
-        # Work at <=256 px; normalised convolution excludes background and hair.
+        # Work at <=256 px; normalised convolution excludes background, hair,
+        # eyes and brows from the estimate.
         scale = min(1., 256/max(height, width))
         weights = zoom(region.astype(np.float32), scale, order=1)
         sigma = max(.5, .25*span*scale)
+        yy, xx = np.mgrid[:height, :width].astype(np.float32)
         def lowpass(rgb):
             luminance = rgb @ np.array([.2126, .7152, .0722], dtype=np.float32)
             small = zoom(luminance*region, scale, order=1)
             low = gaussian_filter(small, sigma)/np.maximum(gaussian_filter(weights, sigma), 1e-6)
-            yy, xx = np.mgrid[:height, :width].astype(np.float32)
             return map_coordinates(low, [yy*(low.shape[0]-1)/max(height-1, 1),
                                          xx*(low.shape[1]-1)/max(width-1, 1)], order=1, mode='nearest')
-        yy, xx = np.mgrid[:height, :width].astype(np.float32)
-        mirror = 2*(a*yy+b)-xx
-        paired = region & (map_coordinates(region.astype(np.float32), [yy, mirror], order=1, mode='constant') > .999)
-        # The low pass straddles the midline, so one estimate sees only part of
-        # the left/right difference; three passes converge (Kira's face view:
-        # cheek ratio .71 -> .88 after one pass, .97 after three).
         low = lowpass(linear)
+        reference = float(np.median(low[region]))
+        # A low pass of the corrected photo is not the corrected low pass (the
+        # gain varies within the kernel), so the estimate is refined in three
+        # passes (a generated face view: p10/p90 of the broad shading .57 ->
+        # .77 after one pass, .89 after three; left/right .73 -> .96).
         gain = np.ones((height, width), dtype=np.float32)
         for _ in range(3):
             current = low if _ == 0 else lowpass(linear*gain[..., None])
-            reflected = map_coordinates(current, [yy, mirror], order=1, mode='nearest')
-            step = np.sqrt(np.maximum(reflected, 1e-6)/np.maximum(current, 1e-6))
-            gain = np.where(paired, gain*step, 1).clip(.5, 2).astype(np.float32)
+            gain = (gain*reference/np.maximum(current, 1e-6)).clip(.5, 2).astype(np.float32)
         gain = gaussian_filter(gain, 1).clip(.5, 2)
-        gain = np.where(paired, 1 + (gain**light_balance-1)*photo_mask, 1).astype(np.float32)
-        left, right = paired & (xx < a*yy+b), paired & (xx > a*yy+b)
+        gain = (1 + (gain**light_balance-1)*photo_mask).astype(np.float32)
+        # Report only: left/right of the landmark midline and the broad spread.
+        points = photo_lm[[10, 168, 6, 1, 0, 13, 14, 152], :2]*[width, height]
+        a, b = np.linalg.lstsq(np.c_[points[:, 1], np.ones(len(points))], points[:, 0], rcond=None)[0]
+        residual = np.sqrt(np.mean((points[:, 0]-a*points[:, 1]-b)**2))
+        left, right = region & (xx < a*yy+b), region & (xx > a*yy+b)
         def ratio(values):
             return float(values[left].mean()/max(float(values[right].mean()), 1e-6)) if left.any() and right.any() else 1.
+        def spread(values):
+            return float(np.percentile(values[region], 10)/max(float(np.percentile(values[region], 90)), 1e-6))
         report.update(midline=dict(a=float(a), b=float(b), residual_px=float(residual)),
-                      balance_gain_range=[float(gain.min()), float(gain.max())], cheek_ratio_before=ratio(low))
+                      balance_gain_range=[float(gain.min()), float(gain.max())],
+                      cheek_ratio_before=ratio(low), shading_p10_p90_before=spread(low))
         linear *= gain[..., None]
-        report['cheek_ratio_after'] = ratio(lowpass(linear))
+        after = lowpass(linear)
+        report.update(cheek_ratio_after=ratio(after), shading_p10_p90_after=spread(after))
     if tone_match:
         # Target = the mesh's own face skin, i.e. exactly the skin the projected
         # face blends into. A ring around the face measured the wrong thing: on
@@ -565,7 +577,8 @@ def adjust_photo(photo, photo_mask, photo_lm, light_balance=0., tone_match=0., b
     adjusted = _linear_to_srgb(linear).astype(np.float32)
     # Balance alone must leave every pixel outside its valid region byte-exact.
     if not tone_match and brightness == 1:
-        adjusted[~paired] = photo[~paired]
+        untouched = photo_mask <= 0
+        adjusted[untouched] = photo[untouched]
     return adjusted, report
 
 

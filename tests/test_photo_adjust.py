@@ -52,6 +52,27 @@ class PhotoAdjustTests(unittest.TestCase):
         self.assertLess(abs(results[1]-np.sqrt(results[0])), .03)
         print('synthetic cheek L/R (off, half, full):', results)
 
+    def test_balance_removes_edge_falloff(self):
+        """A face darker toward its edge (the cheeks turning away from the camera)
+        is evened out. Shading 1 - .7 r**2: rim r in (.75, .9) has mean r**2 ~ .68, so
+        ~ .52; the centre r < .3 ~ .97; rim/core ~ .54 before, within 8 % of 1 at full
+        strength."""
+        photo, mask, lm, dx, mole = synthetic()
+        yy, xx = np.indices(mask.shape)
+        r = np.sqrt((dx/90)**2 + ((yy-128)/110)**2)
+        linear = np.repeat((.3*(1-.7*r**2))[..., None], 3, axis=2).astype(np.float32)
+        linear[mole] *= .4
+        photo = core._linear_to_srgb(linear).astype(np.float32)
+        rim, centre = (mask > .5) & (r > .75) & (r < .9) & ~mole, (mask > .5) & (r < .3)
+        def rim_ratio(img):
+            lum = core._srgb_to_linear(img).mean(axis=2)
+            return lum[rim].mean()/lum[centre].mean()
+        adjusted, report = core.adjust_photo(photo, mask, lm, light_balance=1)
+        self.assertLess(rim_ratio(photo), .6)
+        self.assertLess(abs(rim_ratio(adjusted)-1), .08)
+        self.assertGreater(report['shading_p10_p90_after'], report['shading_p10_p90_before'])
+        print('synthetic rim/core before/after:', rim_ratio(photo), rim_ratio(adjusted))
+
     def test_tone_matches_source_face_skin(self):
         """Target = median of the mesh's own face skin (source_mask > .5); the
         darker neck/hairline around it (here: everything outside the mask) must
