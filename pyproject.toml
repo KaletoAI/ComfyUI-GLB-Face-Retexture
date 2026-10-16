@@ -13,5 +13,6 @@ Documentation = "https://github.com/KaletoAI/ComfyUI-GLB-Face-Retexture#readme"
 Issues = "https://github.com/KaletoAI/ComfyUI-GLB-Face-Retexture/issues"
 
 [tool.comfy]
+PublisherId = "kaleto"
 DisplayName = "GLB Face Retexture (Preserve Geometry)"
 requires-comfyui = ">=0.37.0"
