@@ -95,11 +95,11 @@ class BridgeTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def run_node(self, worker, image=None, source=None):
+    def run_node(self, worker, image=None, source=None, **controls):
         node = self.bridge.GLBFaceRetexture()
         with patch.object(self.bridge, "worker_python", return_value=Path(sys.executable)), \
                 patch.object(self.bridge, "MODELS", ()), patch.object(self.bridge, "run_worker", worker):
-            return node.retexture(source or File3D(str(self.source)), image or self.image, 1.0, .18, 256, 0.0)
+            return node.retexture(source or File3D(str(self.source)), image or self.image, 1.0, .18, 256, 0.0, **controls)
 
     def test_success_returns_native_outputs_from_worker_files(self):
         """A completed worker yields FILE_3D, a 1xHxWx3 IMAGE and the proof text."""
@@ -118,6 +118,22 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(comparison.shape, (1, 4, 6, 3))
         self.assertEqual(json.loads(proof)["status"], "face_texture_only")
         self.assertEqual(result["ui"]["text"], [proof])
+
+    def test_optional_controls_forwarded_and_workflow_order(self):
+        schema = self.bridge.GLBFaceRetexture.INPUT_TYPES()
+        controls = dict(light_balance=.5, tone_match=.75, brightness=.9)
+        self.assertEqual(list(schema["optional"]), list(controls))
+        def worker(command, **kwargs):
+            for name, value in controls.items():
+                self.assertEqual(float(command[command.index("--" + name.replace("_", "-"))+1]), value)
+            return 1, "", "checked controls"
+        with self.assertRaisesRegex(RuntimeError, "checked controls"):
+            self.run_node(worker, **controls)
+        workflow = json.loads((PACKAGE_DIR / "workflows/glb-face-retexture.json").read_text())
+        node = next(n for n in workflow["nodes"] if n["type"] == "GLBFaceRetexture")
+        widgets = {**schema["required"], **schema["optional"]}
+        defaults = [definition[1]["default"] for definition in widgets.values() if "default" in definition[1]]
+        self.assertEqual(node["widgets_values"], defaults)
 
     def test_worker_failure_surfaces_its_error(self):
         """The worker's stderr is the user's error message; no output is returned."""
