@@ -79,7 +79,7 @@ Open [`workflows/glb-face-retexture.json`](workflows/glb-face-retexture.json) in
 
 1. **Load3DAdvanced:** upload/select your own static textured source GLB.
 2. **LoadImage:** upload/select its matching RGB face photo, exactly one image.
-3. **GLB Face Retexture:** adjust the four controls below and queue the workflow.
+3. **GLB Face Retexture:** adjust the controls below and queue the workflow.
 4. **Preview3DAdvanced:** inspect the corrected GLB in the native viewer.
 5. **PreviewImage:** inspect the reference/before/after comparison.
 6. **SaveGLB:** save the corrected model using the default `3d/GLBFaceRetexture` prefix or your own prefix.
@@ -90,7 +90,12 @@ Open [`workflows/glb-face-retexture.json`](workflows/glb-face-retexture.json) in
 | `strength` | 1.0 / 0.01–1.0 | Photo blending strength within the selected face region. |
 | `feather` | 0.18 / 0–0.5 | Mask-edge feathering relative to landmark eye span. |
 | `render_resolution` | 768 / 256–2048, step 64 | CPU registration/render resolution; higher settings require more work. |
+| `light_balance` | 0.0 / 0–1, step 0.05 | Balance broad left/right photo illumination while keeping features. |
+| `tone_match` | 0.0 / 0–1, step 0.05 | Match photo skin colour and brightness to existing mesh skin. |
+| `brightness` | 1.0 / 0.5–1.5, step 0.05 | Final linear brightness scale before projection. |
 | `yaw` | 0 / −180–180 degrees | Source viewing yaw for face registration; not mesh deformation. |
+
+The optional photo controls run in linear light before projection: broad side-light balance, then skin tone matching, then manual brightness. Light balance keeps asymmetric facial features; tone matching samples semantic skin around the source face, excluding hair, and falls back to the source face when too little surrounding skin is available. The proof records measurements and any fallback; the comparison shows the adjusted photo. Defaults preserve the previous output bytes and proof.
 
 Outputs are native **`FILE_3D`** (`corrected_glb`), **`IMAGE`** (`comparison`) and **`STRING`** (`proof_metrics`). The metrics are also shown as node text and describe geometry/texture preservation observations. They are measured on the exported GLB itself: its materials' embedded atlases are decoded and rendered again, so `protected_body_changed_render_pixels` checks the written file, not the in-memory intent. The corrected GLB can connect directly to native preview and save nodes.
 
@@ -132,8 +137,8 @@ On Windows:
 .venv\Scripts\python.exe -m unittest discover -s tests -t .
 ```
 
-GitHub CI installs the private worker on Ubuntu and Windows and runs the suite there. The suite has 31 tests; Windows skips the one symlink-creation test that requires additional privileges. It covers the ComfyUI bridge with stub Comfy/torch modules and a real CPU MediaPipe run on a public-domain portrait fixture (see [`tests/fixtures/README.md`](tests/fixtures/README.md)), but does not establish a verified Windows ComfyUI GUI session.
+GitHub CI installs the private worker on Ubuntu and Windows and runs the suite there. The suite includes synthetic photo-control tests and byte-identical default regression coverage; Windows skips the one symlink-creation test that requires additional privileges. It covers the ComfyUI bridge with stub Comfy/torch modules and a real CPU MediaPipe run on a public-domain portrait fixture (see [`tests/fixtures/README.md`](tests/fixtures/README.md)), but does not establish a verified Windows ComfyUI GUI session.
 
-The intended package ID is **`glb-face-retexture`**, version **1.0.2**. It is **not yet listed in Comfy Registry**; use the GitHub URL installation above. Workflow `cnr_id` metadata records the intended ID, not evidence of registration.
+The intended package ID is **`glb-face-retexture`**, version **1.1.0**. It is **not yet listed in Comfy Registry**; use the GitHub URL installation above. Workflow `cnr_id` metadata records the intended ID, not evidence of registration.
 
 Before publishing, the owner must obtain the actual Comfy Registry publisher identity, add its real `PublisherId` under `[tool.comfy]` in `pyproject.toml`, obtain the corresponding registry API key, and publish using the [official registry instructions](https://docs.comfy.org/registry/publishing). No publisher identity or credentials are fabricated here, and there is no automatic publishing workflow.

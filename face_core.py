@@ -19,7 +19,7 @@ import tempfile
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
-from scipy.ndimage import distance_transform_edt, map_coordinates
+from scipy.ndimage import distance_transform_edt, map_coordinates, gaussian_filter, zoom
 
 FACE_OVAL = (10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
              397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
@@ -452,7 +452,7 @@ def detect_face(detector, mp, rgb, label):
             'refinement_max_pixels': float(movement.max()), 'nose_lateral_eye_fraction': float(lateral)}
 
 
-def semantic_face_mask(segmenter, mp, rgb, landmarks, box, feather):
+def semantic_face_mask(segmenter, mp, rgb, landmarks, box, feather, return_maps=False):
     height, width = rgb.shape[:2]
     def infer(pixels):
         result = segmenter.segment(mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(pixels)))
@@ -483,8 +483,107 @@ def semantic_face_mask(segmenter, mp, rgb, landmarks, box, feather):
     mask = (oval_weight*semantic).astype(np.float32)
     if (mask > .25).sum() < 16:
         raise FaceTextureError('Face semantics contain no usable skin region')
-    return mask, {'skin_classes': [2, 3], 'hair_class': 1, 'face_oval_landmarks': list(FACE_OVAL),
+    result = mask, {'skin_classes': [2, 3], 'hair_class': 1, 'face_oval_landmarks': list(FACE_OVAL),
                   'usable_face_pixels': int((mask > .25).sum()), 'feather_eye_fraction': float(feather)}
+
+    return (*result, {'skin': skin, 'hair': hair}) if return_maps else result
+
+
+def _validate_photo_controls(light_balance, tone_match, brightness):
+    for name, value, low, high in (('light_balance', light_balance, 0, 1),
+                                  ('tone_match', tone_match, 0, 1), ('brightness', brightness, .5, 1.5)):
+        if not np.isfinite(value) or not low <= value <= high:
+            raise FaceTextureError(f'{name} must be finite and in [{low:g},{high:g}]')
+
+
+def _oval_region(landmarks, shape):
+    height, width = shape
+    oval = Image.new('L', (width, height))
+    polygon = landmarks[list(FACE_OVAL), :2]*[width, height]
+    ImageDraw.Draw(oval).polygon([tuple(p) for p in polygon], fill=255)
+    return np.asarray(oval) > 0
+
+
+def adjust_photo(photo, photo_mask, photo_lm, light_balance=0., tone_match=0., brightness=1.,
+                 source_rgb=None, source_mask=None, source_lm=None, source_box=None, source_maps=None):
+    """Balance broad illumination, match rendered skin, then scale in linear light.
+
+    The default path deliberately does not decode/re-encode any photo pixels.
+    Float sRGB output avoids quantization before the atlas's existing final rounding.
+    """
+    _validate_photo_controls(light_balance, tone_match, brightness)
+    if light_balance == tone_match == 0 and brightness == 1:
+        return photo, {}
+    linear = _srgb_to_linear(photo).astype(np.float32)
+    report = dict(light_balance=float(light_balance), tone_match=float(tone_match), brightness=float(brightness))
+    height, width = photo.shape[:2]
+    if light_balance:
+        points = photo_lm[[10, 168, 6, 1, 0, 13, 14, 152], :2]*[width, height]
+        a, b = np.linalg.lstsq(np.c_[points[:, 1], np.ones(len(points))], points[:, 0], rcond=None)[0]
+        residual = np.sqrt(np.mean((points[:, 0]-a*points[:, 1]-b)**2))
+        region = photo_mask > .25
+        span = np.linalg.norm((photo_lm[263, :2]-photo_lm[33, :2])*[width, height])
+        # Work at <=256 px; normalised convolution excludes background and hair.
+        scale = min(1., 256/max(height, width))
+        weights = zoom(region.astype(np.float32), scale, order=1)
+        sigma = max(.5, .25*span*scale)
+        def lowpass(rgb):
+            luminance = rgb @ np.array([.2126, .7152, .0722], dtype=np.float32)
+            small = zoom(luminance*region, scale, order=1)
+            low = gaussian_filter(small, sigma)/np.maximum(gaussian_filter(weights, sigma), 1e-6)
+            yy, xx = np.mgrid[:height, :width].astype(np.float32)
+            return map_coordinates(low, [yy*(low.shape[0]-1)/max(height-1, 1),
+                                         xx*(low.shape[1]-1)/max(width-1, 1)], order=1, mode='nearest')
+        yy, xx = np.mgrid[:height, :width].astype(np.float32)
+        mirror = 2*(a*yy+b)-xx
+        paired = region & (map_coordinates(region.astype(np.float32), [yy, mirror], order=1, mode='constant') > .999)
+        # The low pass straddles the midline, so one estimate sees only part of
+        # the left/right difference; three passes converge (Kira's face view:
+        # cheek ratio .71 -> .88 after one pass, .97 after three).
+        low = lowpass(linear)
+        gain = np.ones((height, width), dtype=np.float32)
+        for _ in range(3):
+            current = low if _ == 0 else lowpass(linear*gain[..., None])
+            reflected = map_coordinates(current, [yy, mirror], order=1, mode='nearest')
+            step = np.sqrt(np.maximum(reflected, 1e-6)/np.maximum(current, 1e-6))
+            gain = np.where(paired, gain*step, 1).clip(.5, 2).astype(np.float32)
+        gain = gaussian_filter(gain, 1).clip(.5, 2)
+        gain = np.where(paired, 1 + (gain**light_balance-1)*photo_mask, 1).astype(np.float32)
+        left, right = paired & (xx < a*yy+b), paired & (xx > a*yy+b)
+        def ratio(values):
+            return float(values[left].mean()/max(float(values[right].mean()), 1e-6)) if left.any() and right.any() else 1.
+        report.update(midline=dict(a=float(a), b=float(b), residual_px=float(residual)),
+                      balance_gain_range=[float(gain.min()), float(gain.max())], cheek_ratio_before=ratio(low))
+        linear *= gain[..., None]
+        report['cheek_ratio_after'] = ratio(lowpass(linear))
+    if tone_match:
+        sh, sw = source_mask.shape
+        oval = _oval_region(source_lm, (sh, sw))
+        distance = distance_transform_edt(~oval)
+        span = np.linalg.norm((source_lm[263, :2]-source_lm[33, :2])*[sw, sh])
+        yy, xx = np.mgrid[:sh, :sw]
+        x0, y0, x1, y1 = source_box
+        region = ((distance > .15*span) & (distance <= .8*span)
+                  & (xx >= x0) & (xx < x1) & (yy >= y0) & (yy < y1)
+                  & (source_maps['skin'] > .5) & (source_maps['hair'] < .1))
+        kind = 'ring'
+        if region.sum() < 200:
+            region, kind = source_mask > .5, 'source_face'
+        if not region.any() or not (photo_mask > .5).any():
+            raise FaceTextureError('Tone match requires usable source and photo skin pixels')
+        target = np.median(_srgb_to_linear(source_rgb).astype(np.float32)[region], axis=0)
+        observed = np.median(linear[photo_mask > .5], axis=0)
+        gain = (target/np.maximum(observed, 1e-6))**tone_match
+        gain = gain.clip(.5, 2).astype(np.float32)
+        linear *= gain
+        report['tone'] = dict(target_rgb_linear=target.tolist(), photo_rgb_linear_before=observed.tolist(),
+                              gain_rgb=gain.tolist(), target_region=kind, target_pixels=int(region.sum()))
+    linear = np.clip(linear*brightness, 0, 1)
+    adjusted = _linear_to_srgb(linear).astype(np.float32)
+    # Balance alone must leave every pixel outside its valid region byte-exact.
+    if not tone_match and brightness == 1:
+        adjusted[~paired] = photo[~paired]
+    return adjusted, report
 
 
 def register_faces(source_lm, photo_lm, source_shape, photo_shape):
@@ -670,15 +769,15 @@ def partition_glb(source, selected, atlas_png):
             + struct.pack('<II', len(payload), 0x004E4942)+payload)
 
 
-def _comparison(photo, before, after):
+def _comparison(photo, before, after, adjusted=False):
     size = before.shape[0]
-    reference = ImageOps.contain(Image.fromarray(photo), (size, size-32))
+    reference = ImageOps.contain(Image.fromarray(np.rint(photo).clip(0, 255).astype(np.uint8)), (size, size-32))
     canvas = Image.new('RGB', (size*3, size+32), (245, 245, 245))
     canvas.paste(reference, ((size-reference.width)//2, 32+(size-reference.height)//2))
     canvas.paste(Image.fromarray(before), (size, 32))
     canvas.paste(Image.fromarray(after), (size*2, 32))
     draw = ImageDraw.Draw(canvas)
-    for index, title in enumerate(('Matching reference photo', 'Original mesh albedo', 'Face texture only / same geometry')):
+    for index, title in enumerate(('Matching reference photo' + (' (adjusted)' if adjusted else ''), 'Original mesh albedo', 'Face texture only / same geometry')):
         draw.text((index*size+10, 10), title, fill=(25, 25, 25))
     output = io.BytesIO()
     canvas.save(output, format='PNG')
@@ -722,8 +821,10 @@ def _write_outputs(files):
 def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
                   comparison_png: Path, proof_json: Path, model_dir: Path,
                   strength: float = 1.0, feather: float = .18,
-                  render_resolution: int = 768, yaw: float = 0.0) -> dict:
+                  render_resolution: int = 768, yaw: float = 0.0,
+                  light_balance: float = 0.0, tone_match: float = 0.0, brightness: float = 1.0) -> dict:
     """Observe, register, paint and append a private face texture; never deform."""
+    _validate_photo_controls(light_balance, tone_match, brightness)
     if not np.isfinite([strength, feather, yaw]).all() or not 0 < strength <= 1 or not 0 <= feather <= 1 or not -180 <= yaw <= 180:
         raise FaceTextureError('Strength must be (0,1], feather [0,1], yaw [-180,180] degrees')
     if not isinstance(render_resolution, int) or not 256 <= render_resolution <= 2048:
@@ -741,6 +842,7 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
     source = read_source(source_glb)
     with Image.open(reference_image) as image:
         photo = np.array(ImageOps.exif_transpose(image).convert('RGB'))
+    reference_rgb_hash = hashlib.sha256(np.asarray(photo.shape, dtype='<u4').tobytes() + photo.tobytes()).hexdigest()
     import mediapipe as mp
     from mediapipe.tasks import python
     from mediapipe.tasks.python import vision
@@ -769,8 +871,12 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
     segment_options = vision.ImageSegmenterOptions(base_options=base(segment_model), running_mode=vision.RunningMode.IMAGE,
                                                    output_confidence_masks=True, output_category_mask=False)
     with vision.ImageSegmenter.create_from_options(segment_options) as segmenter:
-        source_mask, source_semantics = semantic_face_mask(segmenter, mp, before['rgb'], source_lm, source_box, feather)
+        source_result = semantic_face_mask(segmenter, mp, before['rgb'], source_lm, source_box, feather, return_maps=bool(tone_match))
+        source_mask, source_semantics = source_result[:2]
+        source_maps = source_result[2] if tone_match else None
         photo_mask, photo_semantics = semantic_face_mask(segmenter, mp, photo, photo_lm, photo_box, feather)
+    photo, photo_adjust = adjust_photo(photo, photo_mask, photo_lm, light_balance, tone_match, brightness,
+        before['rgb'], source_mask, source_lm, source_box, source_maps)
     affine, registration = register_faces(source_lm, photo_lm, before['rgb'].shape, photo.shape)
     selected = select_triangles(source, before, source_mask, photo_mask, affine)
     atlas_png, pixels = paint_atlas(source, selected, before, source_mask, photo, photo_mask, affine, strength)
@@ -808,7 +914,7 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
         'method': 'Fresh CPU MediaPipe RGB detection and semantics; orthographic visible-triangle photo projection; append-only private atlas',
         'source_sha256': hashlib.sha256(source['raw']).hexdigest(), 'output_sha256': hashlib.sha256(output).hexdigest(),
         'reference_file_sha256': hashlib.sha256(reference_image.read_bytes()).hexdigest(),
-        'reference_rgb_sha256': hashlib.sha256(np.asarray(photo.shape, dtype='<u4').tobytes() + photo.tobytes()).hexdigest(),
+        'reference_rgb_sha256': reference_rgb_hash,
         'models': {'face_sha256': hashlib.sha256(face_model.read_bytes()).hexdigest(), 'segmenter_sha256': hashlib.sha256(segment_model.read_bytes()).hexdigest()},
         'original_vertex_rows': len(source['positions']), 'original_triangle_count': len(source['triangles']),
         'output_triangle_count': sum(len(tris) for tris in emitted), 'selected_triangles': int(selected.sum()),
@@ -827,7 +933,9 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
         'limitations': ['Planar affine does not undo photographic perspective or expression differences.',
                         'Landmarks and semantic probabilities are observations, not anatomical reconstruction.',
                         'No vertex positions, UVs, normals, tangents or original image bytes are changed.']}
+    if photo_adjust:
+        report['photo_adjust'] = photo_adjust
     _write_outputs([(output_glb, output),
-                    (comparison_png, _comparison(photo, before['rgb'], after['rgb'])),
+                    (comparison_png, _comparison(photo, before['rgb'], after['rgb'], adjusted=bool(photo_adjust))),
                     (proof_json, (json.dumps(report, indent=2, allow_nan=False)+'\n').encode())])
     return report

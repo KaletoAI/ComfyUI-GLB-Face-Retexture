@@ -109,7 +109,7 @@
         "width": 1024,
         "height": 1024
       },
-      "title": "1 · Upload your static textured source GLB"
+      "title": "1 \u00b7 Upload your static textured source GLB"
     },
     {
       "id": 2,
@@ -174,19 +174,19 @@
         "image": "",
         "upload": "image"
       },
-      "title": "2 · Upload your matching RGB reference photo"
+      "title": "2 \u00b7 Upload your matching RGB reference photo"
     },
     {
       "id": 3,
       "type": "GLBFaceRetexture",
-      "title": "3 · GLB Face Retexture (Preserve Geometry)",
+      "title": "3 \u00b7 GLB Face Retexture (Preserve Geometry)",
       "pos": [
         540,
         240
       ],
       "size": [
         370,
-        230
+        310
       ],
       "flags": {},
       "order": 2,
@@ -233,6 +233,33 @@
             "name": "yaw"
           },
           "link": null
+        },
+        {
+          "name": "light_balance",
+          "type": "FLOAT",
+          "widget": {
+            "name": "light_balance"
+          },
+          "link": null,
+          "shape": 7
+        },
+        {
+          "name": "tone_match",
+          "type": "FLOAT",
+          "widget": {
+            "name": "tone_match"
+          },
+          "link": null,
+          "shape": 7
+        },
+        {
+          "name": "brightness",
+          "type": "FLOAT",
+          "widget": {
+            "name": "brightness"
+          },
+          "link": null,
+          "shape": 7
         }
       ],
       "outputs": [
@@ -259,20 +286,26 @@
       ],
       "properties": {
         "cnr_id": "glb-face-retexture",
-        "ver": "1.0.2",
+        "ver": "1.1.0",
         "Node name for S&R": "GLBFaceRetexture"
       },
       "widgets_values": [
         1,
         0.18,
         768,
-        0
+        0,
+        0,
+        0,
+        1
       ],
       "widgets_values_named": {
         "strength": 1,
         "feather": 0.18,
         "render_resolution": 768,
-        "yaw": 0
+        "yaw": 0,
+        "light_balance": 0,
+        "tone_match": 0,
+        "brightness": 1
       },
       "color": "#233",
       "bgcolor": "#344"
@@ -387,7 +420,7 @@
         "width": 1024,
         "height": 1024
       },
-      "title": "4 · Corrected GLB — native 3D viewer"
+      "title": "4 \u00b7 Corrected GLB \u2014 native 3D viewer"
     },
     {
       "id": 5,
@@ -424,7 +457,7 @@
         "ver": "0.37.0",
         "Node name for S&R": "PreviewImage"
       },
-      "title": "5 · Real reference / before / after comparison"
+      "title": "5 \u00b7 Real reference / before / after comparison"
     },
     {
       "id": 6,
@@ -480,7 +513,7 @@
         "filename_prefix": "3d/GLBFaceRetexture",
         "image": ""
       },
-      "title": "6 · Save corrected GLB"
+      "title": "6 \u00b7 Save corrected GLB"
     },
     {
       "id": 7,
@@ -500,14 +533,14 @@
       "outputs": [],
       "properties": {},
       "widgets_values": [
-        "Upload your own static textured GLB and matching RGB face photo in nodes 1 and 2. No sample assets are bundled.\n\nAdjust strength, feather, render_resolution and yaw in node 3. Queue, inspect the comparison and native 3D viewer, then save.\n\nTexture projection preserves geometry but partitions original triangles into body/face primitives. It cannot repair silhouette or hidden anatomy. SaveGLB writes 3d/GLBFaceRetexture_*.glb."
+        "Upload your own static textured GLB and matching RGB face photo in nodes 1 and 2. No sample assets are bundled.\n\nAdjust strength, feather, render_resolution yaw, light_balance, tone_match and brightness in node 3. Queue, inspect the comparison and native 3D viewer, then save.\n\nTexture projection preserves geometry but partitions original triangles into body/face primitives. It cannot repair silhouette or hidden anatomy. SaveGLB writes 3d/GLBFaceRetexture_*.glb."
       ],
       "widgets_values_named": {
-        "text": "Upload your own static textured GLB and matching RGB face photo in nodes 1 and 2. No sample assets are bundled.\n\nAdjust strength, feather, render_resolution and yaw in node 3. Queue, inspect the comparison and native 3D viewer, then save.\n\nTexture projection preserves geometry but partitions original triangles into body/face primitives. It cannot repair silhouette or hidden anatomy. SaveGLB writes 3d/GLBFaceRetexture_*.glb."
+        "text": "Upload your own static textured GLB and matching RGB face photo in nodes 1 and 2. No sample assets are bundled.\n\nAdjust strength, feather, render_resolution yaw, light_balance, tone_match and brightness in node 3. Queue, inspect the comparison and native 3D viewer, then save.\n\nTexture projection preserves geometry but partitions original triangles into body/face primitives. It cannot repair silhouette or hidden anatomy. SaveGLB writes 3d/GLBFaceRetexture_*.glb."
       },
       "color": "#432",
       "bgcolor": "#653",
-      "title": "READ ME · Texture projection, not geometry repair"
+      "title": "READ ME \u00b7 Texture projection, not geometry repair"
     }
   ],
   "links": [

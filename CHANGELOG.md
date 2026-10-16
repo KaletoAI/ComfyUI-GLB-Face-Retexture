@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.0 — 2026-10-16
+
+- Add optional `light_balance`, `tone_match` and `brightness` controls to the node and CPU worker CLI; defaults retain byte-identical output and proof.
+- Balance broad side light along a landmark-fitted rolled midline without mirroring facial features, then match linear skin colour to a semantic ring around the rendered source face (with recorded face fallback), and apply final brightness.
+- Record active adjustment measurements in `photo_adjust` and show the adjusted photo in the comparison.
+- Extend synthetic, bridge, CLI and real portrait regression coverage; update the editable workflow with optional widgets after required controls.
+
 ## 1.0.2 — 2026-10-12
 
 - Fix face color under a `baseColorFactor` below 1: the photo is now inverted in linear light as glTF specifies, so viewers show the photo color instead of an sRGB-space approximation (for example 146 instead of 100). Unrepresentable bright colors are counted in `factor_clipped_texture_pixels`.

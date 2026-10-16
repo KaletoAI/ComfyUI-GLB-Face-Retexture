@@ -55,6 +55,17 @@ class VisionInputTests(unittest.TestCase):
             Image.fromarray((pixels * [.8, 1, 1.15]).clip(0, 255).astype(np.uint8)).save(root / "reference.png")
             outputs = root / "corrected.glb", root / "comparison.png", root / "proof.json"
             report = core.run_retexture(source, root / "reference.png", *outputs, MODEL_DIR, render_resolution=256)
+            # Explicit defaults must retain GLB, comparison and proof bytes.
+            expected = [path.read_bytes() for path in outputs]
+            core.run_retexture(source, root / "reference.png", *outputs, MODEL_DIR, render_resolution=256,
+                               light_balance=0, tone_match=0, brightness=1)
+            self.assertEqual(expected, [path.read_bytes() for path in outputs])
+            # Exercise the real semantic ring and all active controls as well.
+            active = core.run_retexture(source, root / "reference.png", root / "active.glb",
+                root / "active.png", root / "active.json", MODEL_DIR, render_resolution=256,
+                light_balance=.5, tone_match=.5, brightness=.9)
+            self.assertIn("tone", active["photo_adjust"])
+            self.assertEqual(active["reference_rgb_sha256"], report["reference_rgb_sha256"])
             self.assertEqual(source.read_bytes(), original)
             proof = json.loads(outputs[2].read_text())
             self.assertEqual(proof, json.loads(json.dumps(report)))
