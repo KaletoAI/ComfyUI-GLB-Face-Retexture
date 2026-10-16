@@ -2,6 +2,10 @@
 
 Project a matching RGB face photo onto the visible face texture of an existing static GLB. **GLB Face Retexture (Preserve Geometry)** (`GLBFaceRetexture`) uses face landmarks and semantic masks to register and blend the photo, without reconstructing or deforming the mesh.
 
+![Before and after: two generated characters turning their heads](docs/before-after.gif)
+
+*Two image-to-3D meshes, each column the same unchanged geometry: the original mesh (left), the projected face photo (middle), and the projection with `light_balance`, `tone_match` and `skin_recolor` at 1 (right). Image-to-3D generators often shift the skin tone away from their input image — the lower character's mesh came out strongly red, also on the scalp and neck. `skin_recolor` corrects that on the whole mesh skin, so the face photo no longer stands out against it; on the upper character, whose generator kept the tone, it changes little. Rendered unlit (albedo only) with [`tools/before_after`](tools/before_after/).*
+
 Geometry is preserved, but the output is **not a byte-identical GLB**: original triangles are partitioned into body and face primitives and a dedicated face texture/material is added. Original vertex positions, UVs, normals, tangents and original image bytes remain unchanged.
 
 ## Requirements
