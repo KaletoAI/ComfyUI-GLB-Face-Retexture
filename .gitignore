@@ -20,3 +20,7 @@ tests/fixtures/private/
 *.task
 *.tflite
 !tests/fixtures/portrait.jpg
+
+# superpowers plans/specs/scratch — local only
+docs/superpowers/
+.superpowers/
