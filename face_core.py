@@ -21,6 +21,9 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 from scipy.ndimage import distance_transform_edt, map_coordinates, gaussian_filter, zoom
 
+MAX_TEXTURE_SIDE = 8192
+MAX_TEXTURE_PIXELS = 8192 * 8192
+
 FACE_OVAL = (10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
              397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
              172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109)
@@ -39,6 +42,31 @@ def _ref(doc, key, index):
     if isinstance(index, bool) or not isinstance(index, int) or not isinstance(items, list) or not 0 <= index < len(items):
         raise FaceTextureError(f'Invalid glTF {key} reference: {index!r}')
     return items[index]
+
+
+def _texture_image(doc, texture) -> int:
+    """Prefer declared WebP; core sources remain PNG/JPEG fallbacks."""
+    if 'source' in texture:
+        image = _ref(doc, 'images', texture['source'])
+        if image.get('mimeType') not in ('image/png', 'image/jpeg'):
+            raise FaceTextureError('Core texture source must be PNG/JPEG')
+    if 'extensions' in texture:
+        extensions = texture['extensions']
+        if not isinstance(extensions, dict) or set(extensions) != {'EXT_texture_webp'}:
+            raise FaceTextureError('Only EXT_texture_webp texture extensions are supported')
+        if 'EXT_texture_webp' not in doc.get('extensionsUsed', []):
+            raise FaceTextureError('EXT_texture_webp must be listed in extensionsUsed')
+        webp = extensions['EXT_texture_webp']
+        if not isinstance(webp, dict):
+            raise FaceTextureError('Invalid EXT_texture_webp texture source')
+        index = webp.get('source')
+        if _ref(doc, 'images', index).get('mimeType') != 'image/webp':
+            raise FaceTextureError('EXT_texture_webp source must be image/webp')
+        return index
+    index = texture.get('source')
+    if _ref(doc, 'images', index).get('mimeType') not in ('image/png', 'image/jpeg'):
+        raise FaceTextureError('Core texture source must be PNG/JPEG')
+    return index
 
 
 def _srgb_to_linear(values):
@@ -138,8 +166,13 @@ def _read_source(path):
         raise FaceTextureError('Expected glTF version 2.0')
     if doc.get('skins') or doc.get('animations'):
         raise FaceTextureError('Source must be static and unskinned; animations/skins are unsupported')
-    if doc.get('extensionsRequired') or doc.get('extensions'):
-        raise FaceTextureError('Required/global glTF extensions are unsupported')
+    if doc.get('extensions'):
+        raise FaceTextureError('Global glTF extensions are unsupported')
+    for name in doc.get('extensionsRequired', []):
+        if name != 'EXT_texture_webp':
+            raise FaceTextureError(f'Unsupported required glTF extension: {name}')
+        if name not in doc.get('extensionsUsed', []):
+            raise FaceTextureError(f'Required glTF extension missing from extensionsUsed: {name}')
     buffers = doc.get('buffers', [])
     if len(buffers) != 1 or 'uri' in buffers[0] or buffers[0]['byteLength'] > len(binary):
         raise FaceTextureError('Expected one embedded geometry buffer')
@@ -148,14 +181,37 @@ def _read_source(path):
             raise FaceTextureError('Compressed/external buffer views are unsupported')
     images = []
     for image in doc.get('images', []):
-        if 'uri' in image or 'bufferView' not in image or image.get('extensions') or image.get('mimeType') not in ('image/png', 'image/jpeg'):
-            raise FaceTextureError('Only embedded PNG/JPEG textures are supported; external/compressed textures are unsupported')
+        if 'uri' in image or 'bufferView' not in image or image.get('extensions') or image.get('mimeType') not in ('image/png', 'image/jpeg', 'image/webp'):
+            raise FaceTextureError('Only embedded PNG/JPEG/WebP images without extensions are supported')
         view = _ref(doc, 'bufferViews', image['bufferView'])
         start = int(view.get('byteOffset', 0))
         stop = start + int(view['byteLength'])
         if start < 0 or stop > len(binary):
             raise FaceTextureError('Image outside embedded buffer')
-        images.append(binary[start:stop])
+        data = binary[start:stop]
+        mime = image['mimeType']
+        magic = {'image/png': data.startswith(b'\x89PNG\r\n\x1a\n'),
+                 'image/jpeg': data.startswith(b'\xff\xd8\xff'),
+                 'image/webp': data.startswith(b'RIFF') and data[8:12] == b'WEBP'}
+        if not magic[mime]:
+            raise FaceTextureError('Embedded image magic does not match mimeType')
+        try:
+            with Image.open(io.BytesIO(data)) as decoded:
+                width, height = decoded.size
+                if width <= 0 or height <= 0 or max(width, height) > MAX_TEXTURE_SIDE or width * height > MAX_TEXTURE_PIXELS:
+                    raise FaceTextureError('Embedded image exceeds texture size limits')
+                if decoded.format != {'image/png': 'PNG', 'image/jpeg': 'JPEG', 'image/webp': 'WEBP'}[mime]:
+                    raise FaceTextureError('Embedded image format does not match mimeType')
+                if getattr(decoded, 'n_frames', 1) != 1:
+                    raise FaceTextureError('Animated embedded images are unsupported')
+                decoded.load()
+        except FaceTextureError:
+            raise
+        except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
+            raise FaceTextureError(f'Embedded image cannot be decoded: {exc}') from exc
+        images.append(data)
+    for texture in doc.get('textures', []):
+        _texture_image(doc, texture)
     meshes = doc.get('meshes', [])
     if len(meshes) != 1 or len(meshes[0].get('primitives', [])) != 1:
         raise FaceTextureError('This node requires one original static textured mesh with one primitive')
@@ -210,11 +266,10 @@ def _read_source(path):
         material = _ref(doc, 'materials', primitive['material'])
         color = material['pbrMetallicRoughness']['baseColorTexture']
         texture = _ref(doc, 'textures', color['index'])
-        _ref(doc, 'images', texture['source'])
-        image_index = texture['source']
+        image_index = _texture_image(doc, texture)
     except (KeyError, FaceTextureError) as exc:
         raise FaceTextureError('Source requires an embedded base-color texture and material') from exc
-    if material.get('extensions') or color.get('extensions') or color.get('texCoord', 0) != 0 or texture.get('extensions') or material.get('alphaMode', 'OPAQUE') != 'OPAQUE':
+    if material.get('extensions') or color.get('extensions') or color.get('texCoord', 0) != 0 or material.get('alphaMode', 'OPAQUE') != 'OPAQUE':
         raise FaceTextureError('Extended/transformed textures, alternate UVs and non-opaque materials are unsupported')
     factor = np.asarray(material['pbrMetallicRoughness'].get('baseColorFactor', [1, 1, 1, 1]), dtype=float)
     if factor.shape != (4,) or not np.isfinite(factor).all() or np.any(factor[:3] <= 0):
@@ -831,6 +886,8 @@ def partition_glb(source, selected, atlas_png, body_atlas_png=None):
     material = copy.deepcopy(source['material'])
     texture = copy.deepcopy(source['texture'])
     texture['source'] = image_index
+    # A copied EXT_texture_webp.source would show the original atlas instead of the new PNG.
+    texture.pop('extensions', None)
     texture_index = len(doc['textures'])
     doc['textures'].append(texture)
     material['name'] = 'Face texture only; unchanged original geometry'
@@ -847,6 +904,8 @@ def partition_glb(source, selected, atlas_png, body_atlas_png=None):
                               'bufferView': blob(body_atlas_png)})
         texture = copy.deepcopy(source['texture'])
         texture['source'] = image_index
+        # A copied EXT_texture_webp.source would show the original atlas instead of the new PNG.
+        texture.pop('extensions', None)
         texture_index = len(doc['textures'])
         doc['textures'].append(texture)
         material = copy.deepcopy(source['material'])
@@ -885,7 +944,7 @@ def _material_atlas(doc, binary, material_index):
     material = _ref(doc, 'materials', material_index)
     pbr = material['pbrMetallicRoughness']
     texture = _ref(doc, 'textures', pbr['baseColorTexture']['index'])
-    view = _ref(doc, 'bufferViews', _ref(doc, 'images', texture['source'])['bufferView'])
+    view = _ref(doc, 'bufferViews', _ref(doc, 'images', _texture_image(doc, texture))['bufferView'])
     start = int(view.get('byteOffset', 0))
     with Image.open(io.BytesIO(binary[start:start + int(view['byteLength'])])) as image:
         atlas = np.array(image.convert('RGBA'))

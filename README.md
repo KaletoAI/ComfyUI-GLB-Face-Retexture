@@ -116,7 +116,9 @@ Cancelling the prompt in ComfyUI stops the CPU worker. A worker that runs longer
 
 ## Supported inputs and limits
 
-- A single mesh with one indexed triangle primitive and an embedded, uncompressed opaque texture.
+- A single mesh with one indexed triangle primitive and an opaque material using embedded PNG/JPEG or WebP textures (`EXT_texture_webp`, e.g. UniForge3D exports).
+- Each embedded image must contain exactly one frame, with positive dimensions, at most 8192 pixels per side and 67,108,864 pixels total. Animated images are refused.
+- The corrected GLB keeps the original WebP images and `EXT_texture_webp` declarations; the new face atlas (and optional recoloured body atlas) is PNG.
 - Static assets only: no rigs, skinning, morph targets or external assets. Orient the model **Y-up, +Z front**.
 - Start each edit from the original single-primitive GLB. The corrected output contains separate body/face primitives and is not supported as input for another projection pass.
 - One matching RGB reference image, not a batch. A detectable face must be visible in both the source registration view and photo.
