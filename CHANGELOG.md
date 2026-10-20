@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.0 — 2026-10-20
+
+- Support embedded WebP textures through `EXT_texture_webp`, including UniForge3D exports and PNG/JPEG fallbacks, with shared texture-reference resolution.
+- Validate every embedded image signature, format, dimensions and single-frame decode; limit textures to 8192 pixels per side and 67,108,864 pixels total.
+- Preserve original WebP images, binary prefix, extension declarations and metallic/roughness maps while new face and optional recoloured body textures reference PNG atlases without copied WebP extensions.
+- Add lossless WebP pixel, export preservation, fallback, JPEG and malformed-input regression coverage.
+
 ## 1.3.0 — 2026-10-16
 
 - Add optional `skin_recolor` (0–1, default 0) to the node, worker CLI and workflow to correct generator-shifted skin across the original atlas toward the light-balanced photo skin tone in linear light.
