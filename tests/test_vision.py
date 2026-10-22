@@ -1,4 +1,5 @@
 """Guard real CPU vision runs: refuse unusable photos, preserve geometry on success."""
+import io
 import json
 from pathlib import Path
 import struct
@@ -91,9 +92,45 @@ class VisionInputTests(unittest.TestCase):
             self.assertEqual(len(doc["meshes"][0]["primitives"]), 2)
             with Image.open(outputs[1]) as comparison:
                 self.assertEqual(comparison.size, (256 * 3, 256 + 32))
+            kinds = [attempt["kind"] for attempt in proof["source_full_observation"]["attempts"]]
+            self.assertFalse(any(kind.startswith("luminance_") for kind in kinds), kinds)
+
+    def test_small_cyan_mesh_face_is_found_through_luminance(self):
+        """A small, saturated cyan face hides from colour detection; luminance finds it."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.glb"
+            canvas = Image.fromarray(cyan_canvas())
+            texture = io.BytesIO()
+            canvas.save(texture, format="PNG")
+            textured_grid(source, texture.getvalue(), mime="image/png")
+            original = source.read_bytes()
+            outputs = root / "corrected.glb", root / "comparison.png", root / "proof.json"
+            report = core.run_retexture(source, PORTRAIT, *outputs, MODEL_DIR, render_resolution=768)
+            kinds = [attempt["kind"] for attempt in report["source_full_observation"]["attempts"]]
+            self.assertIn("luminance_full_image", kinds)
+            self.assertNotIn("detected_bbox_refinement", kinds)
+            self.assertIn("luminance_detected_bbox_refinement", kinds)
+            self.assertFalse(any(kind.startswith("luminance_") for kind in
+                                 (attempt["kind"] for attempt in report["photo_observation"]["attempts"])))
+            self.assertTrue(report["geometry_unchanged"])
+            self.assertEqual(report["protected_body_changed_render_pixels"], 0)
+            self.assertLess(0, report["selected_triangles"])
+            self.assertEqual(source.read_bytes(), original)
 
 
-def textured_grid(path, texture, cells=24):
+def cyan_canvas(size=160):
+    """The fixture portrait as saturated cyan skin, small on a light 768 px canvas."""
+    with Image.open(PORTRAIT) as image:
+        pixels = np.asarray(image.convert("RGB").resize((size, size), Image.LANCZOS)).astype(float)
+    luma = pixels @ [.299, .587, .114]
+    face = np.stack([luma * .15, luma * .95 + 10, luma * .95 + 25], axis=-1).clip(0, 255).astype(np.uint8)
+    canvas = np.full((768, 768, 3), 245, np.uint8)
+    canvas[20:20 + size, 300:300 + size] = face
+    return canvas
+
+
+def textured_grid(path, texture, cells=24, mime="image/jpeg"):
     """A flat +Z-facing grid whose UVs map the whole portrait texture."""
     n = cells + 1
     xs = np.linspace(-1, 1, n)
@@ -116,7 +153,7 @@ def textured_grid(path, texture, cells=24):
                          {"bufferView": 1, "componentType": 5126, "count": n * n, "type": "VEC3",
                           "min": positions.min(axis=0).tolist(), "max": positions.max(axis=0).tolist()},
                          {"bufferView": 2, "componentType": 5126, "count": n * n, "type": "VEC2"}],
-           "images": [{"bufferView": 3, "mimeType": "image/jpeg"}], "textures": [{"source": 0}],
+           "images": [{"bufferView": 3, "mimeType": mime}], "textures": [{"source": 0}],
            "materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}]}
     payload = json.dumps(doc).encode()
     payload += b" " * (-len(payload) % 4)
