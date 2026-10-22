@@ -122,6 +122,7 @@ Cancelling the prompt in ComfyUI stops the CPU worker. A worker that runs longer
 - Static assets only: no rigs, skinning, morph targets or external assets. Orient the model **Y-up, +Z front**.
 - Start each edit from the original single-primitive GLB. The corrected output contains separate body/face primitives and is not supported as input for another projection pass.
 - One matching RGB reference image, not a batch. A detectable face must be visible in both the source registration view and photo.
+- Face detection runs on colour first. Only if that finds no face does it retry on a luminance copy, so small faces with saturated non-skin colours (for example cyan skin) are still found; the proof marks those attempts with a `luminance_` prefix.
 - This is planar photo projection, not 3D face reconstruction. It cannot improve silhouette, add missing geometry, or repair hidden eye anatomy. Perspective and expression differences can remain visible.
 - Registration, masking and texture projection run locally on CPU. There is no cloud generation service and no automatic model regeneration.
 
@@ -152,6 +153,6 @@ On Windows:
 
 GitHub CI installs the private worker on Ubuntu and Windows and runs the suite there. The suite includes synthetic photo-control tests and byte-identical default regression coverage; Windows skips the one symlink-creation test that requires additional privileges. It covers the ComfyUI bridge with stub Comfy/torch modules and a real CPU MediaPipe run on a public-domain portrait fixture (see [`tests/fixtures/README.md`](tests/fixtures/README.md)), but does not establish a verified Windows ComfyUI GUI session.
 
-The registry package is **`glb-face-retexture`** by publisher **`kaleto`**, version **1.3.0**. Every release tag (`v*`) publishes the version in `pyproject.toml` to the Comfy Registry through [`.github/workflows/publish.yml`](.github/workflows/publish.yml) (the official `Comfy-Org/publish-node-action`, pinned to a commit, authenticated by the repository secret `REGISTRY_ACCESS_TOKEN`); it can also be started by hand from the Actions tab. The GitHub URL installation above keeps working.
+The registry package is **`glb-face-retexture`** by publisher **`kaleto`**, version **1.4.1**. Every release tag (`v*`) publishes the version in `pyproject.toml` to the Comfy Registry through [`.github/workflows/publish.yml`](.github/workflows/publish.yml) (the official `Comfy-Org/publish-node-action`, pinned to a commit, authenticated by the repository secret `REGISTRY_ACCESS_TOKEN`); it can also be started by hand from the Actions tab. The GitHub URL installation above keeps working.
 
 To release: raise `version` in `pyproject.toml`, add the CHANGELOG entry, merge, and push the matching `v<version>` tag — `release.yml` creates the GitHub release and `publish.yml` the registry version.

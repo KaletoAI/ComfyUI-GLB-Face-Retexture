@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.1 — 2026-10-22
+
+- Find small faces with saturated non-skin colours. A full-body cyan character (head about 60 px wide in the 768 px source render, glowing eyes) failed with `Source mesh render: no unique usable face detected` at every `render_resolution`, while a tight head crop or a grey copy was detected. When the colour search finds no face, `detect_face` now repeats the same search on a luminance (BT.601) copy and refines there; landmarks are geometry, so registration is unchanged. The proof records those attempts with a `luminance_` prefix.
+- Inputs whose face is found in colour produce byte-identical GLB, comparison and proof to 1.4.0.
+- Add a real vision regression: the fixture portrait as 160 px cyan face on a 768 px canvas fails in colour and is retextured through the luminance pass.
+
 ## 1.4.0 — 2026-10-20
 
 - Support embedded WebP textures through `EXT_texture_webp`, including UniForge3D exports and PNG/JPEG fallbacks, with shared texture-reference resolution.

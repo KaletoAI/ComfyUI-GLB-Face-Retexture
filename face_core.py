@@ -448,9 +448,9 @@ def detect_face(detector, mp, rgb, label):
     if min(height, width) < 32:
         raise FaceTextureError(label + ': image is too small for face detection (minimum 32 pixels per side)')
     attempts = []
-    def detect(box, kind, target=1024):
+    def detect(image, box, kind, target=1024):
         x0, y0, x1, y1 = box
-        patch = rgb[y0:y1, x0:x1]
+        patch = image[y0:y1, x0:x1]
         scale = target/max(patch.shape[:2])
         pixels = _resize(patch, round(patch.shape[1]*scale), round(patch.shape[0]*scale))
         result = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(pixels)))
@@ -467,28 +467,37 @@ def detect_face(detector, mp, rgb, label):
             lm[:, 2] *= (x1-x0)/width
             found.append(lm)
         return found
-    whole = (0, 0, width, height)
-    found = detect(whole, 'full_image', max(width, height))
+    def search(image, prefix):
+        whole = (0, 0, width, height)
+        found = detect(image, whole, prefix+'full_image', max(width, height))
+        if not found:
+            found = detect(image, whole, prefix+'rescaled_full_image', 1600)
+        if not found:
+            # Y-up source upper crops are tried before generic overlapping searches.
+            unique = []
+            boxes = [(width//4, 0, 3*width//4, height//2), (0, 0, width, height//2)]
+            boxes += [(x, y, min(width, x+width//2), min(height, y+height//2))
+                      for y in (0, height//4, height//2) for x in (0, width//4, width//2)]
+            for box in boxes:
+                for lm in detect(image, box, prefix+'overlapping_search_crop'):
+                    span = np.linalg.norm((lm[263, :2]-lm[33, :2])*[width, height])
+                    duplicate = any(np.linalg.norm((lm[1, :2]-old[1, :2])*[width, height]) < .35*span for old in unique)
+                    if not duplicate:
+                        unique.append(lm)
+            found = unique
+        return found
+    image, prefix = rgb, ''
+    found = search(image, prefix)
     if not found:
-        found = detect(whole, 'rescaled_full_image', 1600)
-    if not found:
-        # Y-up source upper crops are tried before generic overlapping searches.
-        unique = []
-        boxes = [(width//4, 0, 3*width//4, height//2), (0, 0, width, height//2)]
-        boxes += [(x, y, min(width, x+width//2), min(height, y+height//2))
-                  for y in (0, height//4, height//2) for x in (0, width//4, width//2)]
-        for box in boxes:
-            for lm in detect(box, 'overlapping_search_crop'):
-                span = np.linalg.norm((lm[263, :2]-lm[33, :2])*[width, height])
-                duplicate = any(np.linalg.norm((lm[1, :2]-old[1, :2])*[width, height]) < .35*span for old in unique)
-                if not duplicate:
-                    unique.append(lm)
-        found = unique
+        # Saturated non-skin tones (e.g. cyan) hide small faces from the colour
+        # detector. Landmarks are geometry, so luma observes the same face.
+        image, prefix = np.repeat(np.rint(rgb @ [.299, .587, .114]).astype(np.uint8)[..., None], 3, axis=2), 'luminance_'
+        found = search(image, prefix)
     if len(found) != 1:
         raise FaceTextureError(label + ': no unique usable face detected; use a matching frontal photo or correct source yaw')
     initial = found[0]
     box = _face_box(initial, width, height)
-    refined = detect(box, 'detected_bbox_refinement')
+    refined = detect(image, box, prefix+'detected_bbox_refinement')
     chosen = refined[0] if refined else initial
     span = float(np.linalg.norm((chosen[263, :2]-chosen[33, :2])*[width, height]))
     if span < 12:
