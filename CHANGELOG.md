@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.2 — 2026-10-31
+
+- Security: the worker venv now installs Pillow 13.0.0 instead of 12.3.0. 12.3.0 carries about 40 advisories, among them heap overflows and use-after-free in the JPEG, TIFF, GIF and BMP decoders and a bundled libopenjp2 with a heap-buffer-overflow write; the worker decodes the photo and every embedded GLB texture with Pillow. Re-run `install.py` (or reinstall the node) so an existing `.venv` picks it up.
+- No change to detection or output.
+
 ## 1.4.1 — 2026-10-22
 
 - Find small faces with saturated non-skin colours. A full-body cyan character (head about 60 px wide in the 768 px source render, glowing eyes) failed with `Source mesh render: no unique usable face detected` at every `render_resolution`, while a tight head crop or a grey copy was detected. When the colour search finds no face, `detect_face` now repeats the same search on a luminance (BT.601) copy and refines there; landmarks are geometry, so registration is unchanged. The proof records those attempts with a `luminance_` prefix.
