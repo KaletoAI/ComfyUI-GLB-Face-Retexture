@@ -283,5 +283,71 @@ class PreservationTests(unittest.TestCase):
                         core.read_source(path)
 
 
+class _Point:
+    def __init__(self, x, y):
+        self.x, self.y, self.z = x, y, 0.
+
+
+class _FakeMp:
+    class ImageFormat:
+        SRGB = 'srgb'
+
+    class Image:
+        def __init__(self, image_format, data):
+            self.data = data
+
+
+def _bearded_face(chin_y):
+    """468 image-normalised landmarks of a small frontal face; only the chin varies."""
+    lm = np.zeros((478, 2))
+    angles = np.linspace(0, 2*np.pi, 478, endpoint=False)
+    lm[:] = np.c_[.5 + .06*np.cos(angles), .2 + .08*np.sin(angles)]
+    for index, xy in {33: (.47, .095), 133: (.49, .097), 362: (.51, .097), 263: (.53, .095),
+                      168: (.5, .093), 1: (.5, .116), 61: (.485, .136), 291: (.515, .136),
+                      152: (.5, chin_y)}.items():
+        lm[index] = xy
+    return lm
+
+
+class _ChinJumpDetector:
+    """Full image: chin at the beard tip. Refinement crop: chin 0.43 eye spans higher."""
+    def __init__(self, width, height):
+        self.size, self.calls = (width, height), 0
+        self.initial = _bearded_face(.177)
+        self.refined = _bearded_face(.177 - .43*.06)
+
+    def detect(self, image):
+        self.calls += 1
+        width, height = self.size
+        lm = self.initial
+        if self.calls > 1:
+            x0, y0, x1, y1 = core._face_box(np.c_[self.initial, np.zeros(478)], width, height)
+            lm = (self.refined*[width, height] - [x0, y0]) / [x1-x0, y1-y0]
+        return type('Result', (), {'face_landmarks': [[_Point(*xy) for xy in lm]]})()
+
+
+@unittest.skipIf(WORKER_IMPORT_ERROR is not None, "Standalone ComfyUI worker dependencies unavailable: " + str(WORKER_IMPORT_ERROR))
+class DetectFaceRefinementTests(unittest.TestCase):
+    """Job fd1f499d: a beard hides the chin of a small full-body face, so the
+    bbox refinement moves only landmark 152 by 0.43 outer-eye spans."""
+
+    def setUp(self):
+        self.rgb = np.full((768, 768, 3), 245, np.uint8)
+
+    def test_strict_detection_still_refuses_implausible_refinement(self):
+        with self.assertRaisesRegex(core.FaceTextureError, 'changed the face implausibly'):
+            core.detect_face(_ChinJumpDetector(768, 768), _FakeMp, self.rgb, 'Refined source head render')
+
+    def test_locating_detection_keeps_initial_face_when_refinement_disagrees(self):
+        detector = _ChinJumpDetector(768, 768)
+        lm, box, observation = core.detect_face(detector, _FakeMp, self.rgb, 'Source mesh render',
+                                                locate_only=True)
+        np.testing.assert_allclose(lm[:, :2], detector.initial)
+        self.assertEqual(box, core._face_box(lm, 768, 768))
+        self.assertTrue(observation['refinement_rejected'])
+        self.assertFalse(observation['refinement_used'])
+        self.assertGreater(observation['refinement_max_pixels'], .4*observation['eye_span_pixels'])
+
+
 if __name__ == '__main__':
     unittest.main()
