@@ -442,8 +442,12 @@ def _face_box(landmarks, width, height):
     return box
 
 
-def detect_face(detector, mp, rgb, label):
-    """Search/refine RGB crops; every result is remapped to the actual image."""
+def detect_face(detector, mp, rgb, label, locate_only=False):
+    """Search/refine RGB crops; every result is remapped to the actual image.
+
+    `locate_only` marks a detection that merely places a re-render camera: an
+    implausible refinement then keeps the initial face instead of failing.
+    """
     height, width = rgb.shape[:2]
     if min(height, width) < 32:
         raise FaceTextureError(label + ': image is too small for face detection (minimum 32 pixels per side)')
@@ -499,12 +503,19 @@ def detect_face(detector, mp, rgb, label):
     box = _face_box(initial, width, height)
     refined = detect(image, box, prefix+'detected_bbox_refinement')
     chosen = refined[0] if refined else initial
-    span = float(np.linalg.norm((chosen[263, :2]-chosen[33, :2])*[width, height]))
+    eye_span = lambda lm: float(np.linalg.norm((lm[263, :2]-lm[33, :2])*[width, height]))
+    movement = np.linalg.norm((chosen[list(STABLE), :2]-initial[list(STABLE), :2])*[width, height], axis=1)
+    rejected = bool(movement.max() > .4*eye_span(chosen))
+    if rejected and not locate_only:
+        raise FaceTextureError(label + ': crop refinement changed the face implausibly')
+    if rejected:
+        # A beard hides the chin of a small full-body face, so landmark 152 can
+        # jump between crops. Locating the head tolerates that; registration
+        # uses the strict detection on the native head re-render.
+        chosen = initial
+    span = eye_span(chosen)
     if span < 12:
         raise FaceTextureError(label + ': native outer-eye span is below 12 pixels')
-    movement = np.linalg.norm((chosen[list(STABLE), :2]-initial[list(STABLE), :2])*[width, height], axis=1)
-    if movement.max() > .4*span:
-        raise FaceTextureError(label + ': crop refinement changed the face implausibly')
     if np.any(chosen[[33, 263, 152], :2] <= 0) or np.any(chosen[[33, 263, 152], :2] >= 1):
         raise FaceTextureError(label + ': registration anchors outside the image')
     eye = chosen[263, :2]-chosen[33, :2]
@@ -512,7 +523,8 @@ def detect_face(detector, mp, rgb, label):
     if lateral > .4:
         raise FaceTextureError(label + ': face is too oblique for planar photo registration')
     return chosen, _face_box(chosen, width, height), {'face_count': 1, 'attempts': attempts,
-            'eye_span_pixels': span, 'refinement_used': bool(refined),
+            'eye_span_pixels': span, 'refinement_used': bool(refined) and not rejected,
+            'refinement_rejected': rejected,
             'refinement_max_pixels': float(movement.max()), 'nose_lateral_eye_fraction': float(lateral)}
 
 
@@ -1019,7 +1031,8 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
     full_render = render_albedo(source, full_view)
     with vision.FaceLandmarker.create_from_options(options) as detector:
         photo_lm, photo_box, photo_observation = detect_face(detector, mp, photo, 'Reference photo')
-        initial_lm, initial_box, full_observation = detect_face(detector, mp, full_render['rgb'], 'Source mesh render')
+        initial_lm, initial_box, full_observation = detect_face(detector, mp, full_render['rgb'], 'Source mesh render',
+                                                                    locate_only=True)
         # Re-render the detected head at native resolution rather than merely
         # enlarging low-resolution body pixels. Camera derives from observation.
         x0, y0, x1, y1 = initial_box

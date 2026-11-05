@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.3 — 2026-11-05
+
+- Accept small bearded faces in the full source render. A full-body character with a full beard (outer-eye span about 41 px in the 768 px render) failed with `Source mesh render: crop refinement changed the face implausibly`: the bbox refinement agreed with the first detection within 3 px on eyes, nose and mouth, but the beard-hidden chin (landmark 152) moved 0.43 eye spans, just above the 0.4 limit. That detection only places the camera for the native head re-render, so it now keeps the first detection instead of failing. The photo and the head re-render, whose landmarks drive registration, keep the strict check.
+- Every detection in the proof records `refinement_rejected`; `refinement_used` is false when the refinement was rejected.
+- Otherwise unchanged: GLB, comparison and proof (apart from the new field) are byte-identical to 1.4.2 on the portrait grid (defaults and all controls active) and the cyan luminance case.
+- Add unit tests for the strict and the locate-only refinement paths with a fake detector.
+
 ## 1.4.2 — 2026-10-31
 
 - Security: the worker venv now installs Pillow 13.0.0 instead of 12.3.0. 12.3.0 carries about 40 advisories, among them heap overflows and use-after-free in the JPEG, TIFF, GIF and BMP decoders and a bundled libopenjp2 with a heap-buffer-overflow write; the worker decodes the photo and every embedded GLB texture with Pillow. Re-run `install.py` (or reinstall the node) so an existing `.venv` picks it up.
