@@ -391,20 +391,37 @@ class DetectFaceConfirmationTests(unittest.TestCase):
             rgb[y:y+40, x:x+40] = colour
         return rgb
 
+    def detect(self, rgb, label='Source mesh render', **options):
+        return core.detect_face(_PareidoliaDetector(), _FakeMp, rgb, label, **options)
+
     def test_unconfirmed_body_detection_is_dropped(self):
         rgb = self.render((_REAL, (365, 70)), (_GHOST, (310, 185)))
-        lm, box, observation = core.detect_face(_PareidoliaDetector(), _FakeMp, rgb, 'Source mesh render',
-                                                locate_only=True)
+        lm, box, observation = self.detect(rgb, locate_only=True, mesh_render=True)
         np.testing.assert_allclose(lm[1, :2]*768, (385, 90), atol=1)
         self.assertEqual(box, core._face_box(lm, 768, 768))
         kinds = [attempt['kind'] for attempt in observation['attempts']]
         self.assertIn('full_image_confirmation', kinds)
 
-    def test_two_confirmed_faces_are_still_refused(self):
+    def test_confirmation_must_find_the_face_at_the_same_place(self):
+        # The ghost's own crop shows the edge of the real head just above it.
+        rgb = self.render((_REAL, (365, 70)), (_GHOST, (365, 112)))
+        lm, _, _ = self.detect(rgb, 'Refined source head render', mesh_render=True)
+        np.testing.assert_allclose(lm[1, :2]*768, (385, 90), atol=1)
+
+    def test_two_confirmed_faces_in_a_render_are_refused(self):
         rgb = self.render((_REAL, (200, 70)), (_REAL2, (500, 70)))
         with self.assertRaisesRegex(core.FaceTextureError, 'multiple faces are unsupported'):
-            core.detect_face(_PareidoliaDetector(), _FakeMp, rgb, 'Reference photo')
+            self.detect(rgb, locate_only=True, mesh_render=True)
 
+    def test_adjacent_faces_seen_in_each_others_crop_are_refused(self):
+        rgb = self.render((_REAL, (365, 70)), (_REAL2, (410, 70)))
+        with self.assertRaisesRegex(core.FaceTextureError, 'multiple faces are unsupported'):
+            self.detect(rgb, 'Refined source head render', mesh_render=True)
+
+    def test_photo_refuses_every_second_face(self):
+        rgb = self.render((_REAL, (365, 70)), (_GHOST, (310, 185)))
+        with self.assertRaisesRegex(core.FaceTextureError, 'multiple faces are unsupported'):
+            self.detect(rgb, 'Reference photo')
 
 if __name__ == '__main__':
     unittest.main()

@@ -442,11 +442,13 @@ def _face_box(landmarks, width, height):
     return box
 
 
-def detect_face(detector, mp, rgb, label, locate_only=False):
+def detect_face(detector, mp, rgb, label, locate_only=False, mesh_render=False):
     """Search/refine RGB crops; every result is remapped to the actual image.
 
     `locate_only` marks a detection that merely places a re-render camera: an
     implausible refinement then keeps the initial face instead of failing.
+    `mesh_render` marks a render of the single source mesh: a second face there
+    must be confirmed in its own crop. A photo refuses every second face.
     """
     height, width = rgb.shape[:2]
     if min(height, width) < 32:
@@ -478,10 +480,10 @@ def detect_face(detector, mp, rgb, label, locate_only=False):
             lm[:, 1] = (y0 + lm[:, 1]*(y1-y0))/height
             lm[:, 2] *= (x1-x0)/width
             found.append(lm)
-        if len(found) > 1 and confirm:
+        if len(found) > 1 and confirm and mesh_render:
             found = [lm for lm in found if confirmed(image, lm, kind)]
-            if len(found) > 1:
-                raise FaceTextureError(label + ': multiple faces are unsupported')
+        if len(found) > 1 and confirm:
+            raise FaceTextureError(label + ': multiple faces are unsupported')
         return found
     def search(image, prefix):
         whole = (0, 0, width, height)
@@ -1043,7 +1045,7 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
     with vision.FaceLandmarker.create_from_options(options) as detector:
         photo_lm, photo_box, photo_observation = detect_face(detector, mp, photo, 'Reference photo')
         initial_lm, initial_box, full_observation = detect_face(detector, mp, full_render['rgb'], 'Source mesh render',
-                                                                    locate_only=True)
+                                                                    locate_only=True, mesh_render=True)
         # Re-render the detected head at native resolution rather than merely
         # enlarging low-resolution body pixels. Camera derives from observation.
         x0, y0, x1, y1 = initial_box
@@ -1057,7 +1059,8 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
         bounds = (center_x-half_span, center_y-half_span, center_x+half_span, center_y+half_span)
         view = make_view(source['positions'], render_resolution, yaw, bounds)
         before = render_albedo(source, view)
-        source_lm, source_box, source_observation = detect_face(detector, mp, before['rgb'], 'Refined source head render')
+        source_lm, source_box, source_observation = detect_face(detector, mp, before['rgb'], 'Refined source head render',
+                                                                 mesh_render=True)
     segment_options = vision.ImageSegmenterOptions(base_options=base(segment_model), running_mode=vision.RunningMode.IMAGE,
                                                    output_confidence_masks=True, output_category_mask=False)
     with vision.ImageSegmenter.create_from_options(segment_options) as segmenter:

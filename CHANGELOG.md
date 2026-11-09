@@ -2,10 +2,10 @@
 
 ## 1.4.4 — 2026-11-09
 
-- Ignore a second "face" on body texture. On a full-body render (head about 60 px wide in the 768 px render) no face was found in the whole image, and the upper search crop reported the head plus a second face on the chest, so the job failed with `Source mesh render: multiple faces are unsupported`. When a detection view now reports more than one face, each candidate is re-detected in its own face crop and kept only if a face appears there at the same nose position (within 0.35 outer-eye spans). The chest vanished in its own crop, the head was found again within 0.02 eye spans. Two confirmed faces are still refused, in the photo as well as in the render.
+- Ignore a second "face" on body texture. On a full-body render (head about 60 px wide in the 768 px render) no face was found in the whole image, and the upper search crop reported the head plus a second face on the chest, so the job failed with `Source mesh render: multiple faces are unsupported`. When a view of the source mesh (full render or head re-render) now reports more than one face, each candidate is re-detected in its own face crop and kept only if a face appears there at the same nose position (within 0.35 outer-eye spans). The chest vanished in its own crop, the head was found again within 0.02 eye spans. Two confirmed faces in a render are still refused. The reference photo is unchanged: it refuses every second face, confirmed or not, so a hard-to-detect second person cannot slip through.
 - The proof lists the extra detections as `<kind>_confirmation` attempts.
 - Otherwise unchanged: a view with at most one face takes the same path as in 1.4.3, so every input that succeeded before gives byte-identical GLB, comparison and proof.
-- Add unit tests for an unconfirmed body detection and for two confirmed faces with a fake detector.
+- Add unit tests with a fake detector: an unconfirmed body detection, a confirmation crop that only shows a neighbouring face, two separate and two adjacent confirmed faces in a render, and a photo with a second detection.
 
 ## 1.4.3 — 2026-11-05
 
