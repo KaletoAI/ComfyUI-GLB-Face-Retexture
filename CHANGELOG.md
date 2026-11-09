@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.4 — 2026-11-09
+
+- Ignore a second "face" on body texture. On a full-body render (head about 60 px wide in the 768 px render) no face was found in the whole image, and the upper search crop reported the head plus a second face on the chest, so the job failed with `Source mesh render: multiple faces are unsupported`. When a detection view now reports more than one face, each candidate is re-detected in its own face crop and kept only if a face appears there at the same nose position (within 0.35 outer-eye spans). The chest vanished in its own crop, the head was found again within 0.02 eye spans. Two confirmed faces are still refused, in the photo as well as in the render.
+- The proof lists the extra detections as `<kind>_confirmation` attempts.
+- Otherwise unchanged: a view with at most one face takes the same path as in 1.4.3, so every input that succeeded before gives byte-identical GLB, comparison and proof.
+- Add unit tests for an unconfirmed body detection and for two confirmed faces with a fake detector.
+
 ## 1.4.3 — 2026-11-05
 
 - Accept small bearded faces in the full source render. A full-body character with a full beard (outer-eye span about 41 px in the 768 px render) failed with `Source mesh render: crop refinement changed the face implausibly`: the bbox refinement agreed with the first detection within 3 px on eyes, nose and mouth, but the beard-hidden chin (landmark 152) moved 0.43 eye spans, just above the 0.4 limit. That detection only places the camera for the native head re-render, so it now keeps the first detection instead of failing. The photo and the head re-render, whose landmarks drive registration, keep the strict check.

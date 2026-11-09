@@ -349,5 +349,62 @@ class DetectFaceRefinementTests(unittest.TestCase):
         self.assertGreater(observation['refinement_max_pixels'], .4*observation['eye_span_pixels'])
 
 
+_REAL, _REAL2, _GHOST = (200, 40, 40), (40, 160, 40), (40, 40, 200)
+
+
+def _marker_face(rgb, colour):
+    """Patch-normalised landmarks of a frontal face filling the marker's bounding box."""
+    ys, xs = np.nonzero((np.abs(rgb.astype(int) - colour) < 12).all(axis=2))
+    if len(xs) == 0:
+        return None
+    height, width = rgb.shape[:2]
+    cx, cy = (xs.min()+xs.max()+1)/2/width, (ys.min()+ys.max()+1)/2/height
+    rx, ry = (xs.max()-xs.min()+1)/2/width, (ys.max()-ys.min()+1)/2/height
+    angles = np.linspace(0, 2*np.pi, 478, endpoint=False)
+    lm = np.c_[cx + rx*np.cos(angles), cy + ry*np.sin(angles)]
+    for index, (dx, dy) in {33: (-.5, -.3), 133: (-.2, -.28), 362: (.2, -.28), 263: (.5, -.3),
+                            168: (0, -.33), 1: (0, 0), 61: (-.25, .4), 291: (.25, .4), 152: (0, .9)}.items():
+        lm[index] = (cx + dx*rx, cy + dy*ry)
+    return lm
+
+
+class _PareidoliaDetector:
+    """A real face is found in every view that shows it. The ghost (body texture)
+    is reported only as a small part of a larger view, never in its own face crop."""
+
+    def detect(self, image):
+        faces = [lm for lm in (_marker_face(image.data, colour) for colour in (_REAL, _REAL2)) if lm is not None]
+        ghost = _marker_face(image.data, _GHOST)
+        if ghost is not None and np.ptp(ghost[:, 0]) < .1:
+            faces.append(ghost)
+        return type('Result', (), {'face_landmarks': [[_Point(*xy) for xy in lm] for lm in faces]})()
+
+
+@unittest.skipIf(WORKER_IMPORT_ERROR is not None, "Standalone ComfyUI worker dependencies unavailable: " + str(WORKER_IMPORT_ERROR))
+class DetectFaceConfirmationTests(unittest.TestCase):
+    """Job a030ad58: a search crop of a full-body render reported the small head
+    and a second "face" on the chest, which vanishes in its own face crop."""
+
+    def render(self, *markers):
+        rgb = np.full((768, 768, 3), 245, np.uint8)
+        for colour, (x, y) in markers:
+            rgb[y:y+40, x:x+40] = colour
+        return rgb
+
+    def test_unconfirmed_body_detection_is_dropped(self):
+        rgb = self.render((_REAL, (365, 70)), (_GHOST, (310, 185)))
+        lm, box, observation = core.detect_face(_PareidoliaDetector(), _FakeMp, rgb, 'Source mesh render',
+                                                locate_only=True)
+        np.testing.assert_allclose(lm[1, :2]*768, (385, 90), atol=1)
+        self.assertEqual(box, core._face_box(lm, 768, 768))
+        kinds = [attempt['kind'] for attempt in observation['attempts']]
+        self.assertIn('full_image_confirmation', kinds)
+
+    def test_two_confirmed_faces_are_still_refused(self):
+        rgb = self.render((_REAL, (200, 70)), (_REAL2, (500, 70)))
+        with self.assertRaisesRegex(core.FaceTextureError, 'multiple faces are unsupported'):
+            core.detect_face(_PareidoliaDetector(), _FakeMp, rgb, 'Reference photo')
+
+
 if __name__ == '__main__':
     unittest.main()

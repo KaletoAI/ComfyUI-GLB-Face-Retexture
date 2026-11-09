@@ -452,15 +452,23 @@ def detect_face(detector, mp, rgb, label, locate_only=False):
     if min(height, width) < 32:
         raise FaceTextureError(label + ': image is too small for face detection (minimum 32 pixels per side)')
     attempts = []
-    def detect(image, box, kind, target=1024):
+    eye_span = lambda lm: float(np.linalg.norm((lm[263, :2]-lm[33, :2])*[width, height]))
+    def confirmed(image, lm, kind):
+        # A large view can report a second "face" on body texture (e.g. a chest
+        # under a small full-body head). A real face is found again in its own crop.
+        try:
+            box = _face_box(lm, width, height)
+        except FaceTextureError:
+            return False
+        again = detect(image, box, kind+'_confirmation', confirm=False)
+        return any(np.linalg.norm((other[1, :2]-lm[1, :2])*[width, height]) < .35*eye_span(lm) for other in again)
+    def detect(image, box, kind, target=1024, confirm=True):
         x0, y0, x1, y1 = box
         patch = image[y0:y1, x0:x1]
         scale = target/max(patch.shape[:2])
         pixels = _resize(patch, round(patch.shape[1]*scale), round(patch.shape[0]*scale))
         result = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(pixels)))
         attempts.append({'kind': kind, 'box_pixels': list(box), 'input_size': [pixels.shape[1], pixels.shape[0]], 'face_count': len(result.face_landmarks)})
-        if len(result.face_landmarks) > 1:
-            raise FaceTextureError(label + ': multiple faces are unsupported')
         found = []
         for raw in result.face_landmarks:
             lm = np.asarray([[p.x, p.y, p.z] for p in raw], dtype=float)
@@ -470,6 +478,10 @@ def detect_face(detector, mp, rgb, label, locate_only=False):
             lm[:, 1] = (y0 + lm[:, 1]*(y1-y0))/height
             lm[:, 2] *= (x1-x0)/width
             found.append(lm)
+        if len(found) > 1 and confirm:
+            found = [lm for lm in found if confirmed(image, lm, kind)]
+            if len(found) > 1:
+                raise FaceTextureError(label + ': multiple faces are unsupported')
         return found
     def search(image, prefix):
         whole = (0, 0, width, height)
@@ -503,7 +515,6 @@ def detect_face(detector, mp, rgb, label, locate_only=False):
     box = _face_box(initial, width, height)
     refined = detect(image, box, prefix+'detected_bbox_refinement')
     chosen = refined[0] if refined else initial
-    eye_span = lambda lm: float(np.linalg.norm((lm[263, :2]-lm[33, :2])*[width, height]))
     movement = np.linalg.norm((chosen[list(STABLE), :2]-initial[list(STABLE), :2])*[width, height], axis=1)
     rejected = bool(movement.max() > .4*eye_span(chosen))
     if rejected and not locate_only:
