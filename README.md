@@ -124,6 +124,22 @@ The photo color is matched under glTF's `baseColorFactor`, which multiplies the 
 
 Cancelling the prompt in ComfyUI stops the CPU worker. A worker that runs longer than 1800 seconds is stopped with an error; set the environment variable `GLB_FACE_RETEXTURE_TIMEOUT` (seconds) before starting ComfyUI to change that limit.
 
+## Locate face regions (GLB Face Regions)
+
+The second node, **GLB Face Regions (Locate Only)** (`GLBFaceRegions`; worker `--locate`), needs no photo. It finds the face in a head render of the source mesh, just like the retexture, and labels every vertex row. Nothing is projected; positions, UVs, normals, indices, vertex order, images and materials stay byte-identical, and the original binary remains an exact prefix. The output GLB adds two float vertex attributes and a root `extras.glb_face_regions` block:
+
+| `_FACE_REGION` | Region (subject's side; MediaPipe landmark 33 is the subject's right outer eye corner) | Hull dilation |
+| --- | --- | --- |
+| 0 | none | |
+| 1 / 2 | right / left eye with lid rim | 0.12 eye spans |
+| 3 / 4 | right / left brow | 0.05 |
+| 5 | lips (including the mouth opening) | 0.06 |
+| 6 | nose | 0.04 |
+
+A vertex takes the region of its render pixel when it lies at most `depth_window` eye spans (default 0.3) behind the visible surface there. Hidden vertices in eye sockets, the inside of the mouth or under lash flaps are therefore labelled; the back of the head is not. On overlap, eyes win over brows, lips and nose. `_FACE_DEPTH` gives each labelled vertex's distance behind the visible surface in eye spans (0 = on the visible skin). Generated meshes often carry inner layers several millimetres under the face; this attribute separates them from the outer skin.
+
+`extras.glb_face_regions` holds the legend, `eye_span_model_units`, `depth_window_eye_fraction` and `landmarks_model`: eye corners (33, 133, 362, 263), nose tip (1), mouth corners (61, 291), lip centres (0, 17), chin (152) and brow peaks (105, 334), each on the visible surface in scene (world) coordinates. The proof adds per-region vertex and hidden-vertex counts. The preview tints the regions on the head render and draws labelled hidden vertices as white squares. Use the labels, for example, to smooth splinters or to close hollow eye sockets before a face retexture; the node itself never moves a vertex.
+
 ## Supported inputs and limits
 
 - A single mesh with one indexed triangle primitive and an opaque material using embedded PNG/JPEG or WebP textures (`EXT_texture_webp`, e.g. UniForge3D exports).

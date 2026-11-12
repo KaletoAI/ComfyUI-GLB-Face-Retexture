@@ -156,6 +156,36 @@ class BridgeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "projection_mask.png"):
             self.run_node(worker)
 
+    def test_regions_node_runs_the_worker_in_locate_mode(self):
+        """GLBFaceRegions needs no photo and returns FILE_3D, preview IMAGE and proof."""
+        def worker(command, **kwargs):
+            self.assertIn("--locate", command)
+            self.assertNotIn("--reference-image", command)
+            arguments = dict(zip(command, command[1:]))
+            self.assertEqual(float(arguments["--depth-window"]), .4)
+            Path(arguments["--output-glb"]).write_bytes(b"glTF regions")
+            Image.new("RGB", (5, 3)).save(arguments["--preview-png"])
+            Path(arguments["--proof-json"]).write_text(json.dumps({"status": "face_regions_only"}), encoding="utf-8")
+            return 0, "", ""
+        node = self.bridge.GLBFaceRegions()
+        self.assertEqual(self.bridge.NODE_CLASS_MAPPINGS["GLBFaceRegions"], self.bridge.GLBFaceRegions)
+        with patch.object(self.bridge, "worker_python", return_value=Path(sys.executable)), \
+                patch.object(self.bridge, "MODELS", ()), patch.object(self.bridge, "run_worker", worker):
+            result = node.locate(File3D(str(self.source)), 256, 0.0, depth_window=.4)
+            glb, preview, proof = result["result"]
+            self.assertEqual(Path(glb.get_source()).read_bytes(), b"glTF regions")
+            self.assertEqual(preview.shape, (1, 3, 5, 3))
+            self.assertEqual(json.loads(proof)["status"], "face_regions_only")
+            def silent(command, **kwargs):
+                arguments = dict(zip(command, command[1:]))
+                Path(arguments["--output-glb"]).write_bytes(b"glTF regions")
+                Path(arguments["--proof-json"]).write_text("{}", encoding="utf-8")
+                return 0, "", ""
+            with patch.object(self.bridge, "run_worker", silent), self.assertRaisesRegex(RuntimeError, "regions.png"):
+                node.locate(File3D(str(self.source)), 256, 0.0)
+            with self.assertRaisesRegex(ValueError, "static textured GLB"):
+                node.locate(File3D(str(self.root / "model.obj")), 256, 0.0)
+
     def test_worker_failure_surfaces_its_error(self):
         """The worker's stderr is the user's error message; no output is returned."""
         def worker(command, **kwargs):

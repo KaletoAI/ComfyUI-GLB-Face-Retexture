@@ -1275,6 +1275,30 @@ def _write_outputs(files):
             temporary.unlink(missing_ok=True)
 
 
+def observe_source(detector, mp, source, render_resolution, yaw):
+    """Locate the head in a full render, re-render it natively and detect its landmarks."""
+    full_view = make_view(source['positions'], render_resolution, yaw)
+    full_render = render_albedo(source, full_view)
+    initial_lm, initial_box, full_observation = detect_face(detector, mp, full_render['rgb'], 'Source mesh render',
+                                                            locate_only=True, mesh_render=True)
+    # Re-render the detected head at native resolution rather than merely
+    # enlarging low-resolution body pixels. Camera derives from observation.
+    x0, y0, x1, y1 = initial_box
+    left, bottom, right, top = full_view['bounds']
+    bounds = (left+x0/render_resolution*(right-left), top-y1/render_resolution*(top-bottom),
+              left+x1/render_resolution*(right-left), top-y0/render_resolution*(top-bottom))
+    # Clipping the detected crop at a full-render border must not change
+    # the head's aspect ratio. Extend camera bounds, not source geometry.
+    center_x, center_y = (bounds[0]+bounds[2])/2, (bounds[1]+bounds[3])/2
+    half_span = max(bounds[2]-bounds[0], bounds[3]-bounds[1])/2
+    bounds = (center_x-half_span, center_y-half_span, center_x+half_span, center_y+half_span)
+    view = make_view(source['positions'], render_resolution, yaw, bounds)
+    before = render_albedo(source, view)
+    source_lm, source_box, source_observation = detect_face(detector, mp, before['rgb'], 'Refined source head render',
+                                                             mesh_render=True)
+    return full_view, full_render, full_observation, view, before, source_lm, source_box, source_observation
+
+
 def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
                   comparison_png: Path, proof_json: Path, model_dir: Path,
                   strength: float = 1.0, feather: float = .18,
@@ -1319,27 +1343,10 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
     base = lambda path: python.BaseOptions(model_asset_path=str(path), delegate=python.BaseOptions.Delegate.CPU)
     options = vision.FaceLandmarkerOptions(base_options=base(face_model), running_mode=vision.RunningMode.IMAGE,
         num_faces=2, min_face_detection_confidence=.5, min_face_presence_confidence=.5, min_tracking_confidence=.5)
-    full_view = make_view(source['positions'], render_resolution, yaw)
-    full_render = render_albedo(source, full_view)
     with vision.FaceLandmarker.create_from_options(options) as detector:
         photo_lm, photo_box, photo_observation = detect_face(detector, mp, photo, 'Reference photo')
-        initial_lm, initial_box, full_observation = detect_face(detector, mp, full_render['rgb'], 'Source mesh render',
-                                                                    locate_only=True, mesh_render=True)
-        # Re-render the detected head at native resolution rather than merely
-        # enlarging low-resolution body pixels. Camera derives from observation.
-        x0, y0, x1, y1 = initial_box
-        left, bottom, right, top = full_view['bounds']
-        bounds = (left+x0/render_resolution*(right-left), top-y1/render_resolution*(top-bottom),
-                  left+x1/render_resolution*(right-left), top-y0/render_resolution*(top-bottom))
-        # Clipping the detected crop at a full-render border must not change
-        # the head's aspect ratio. Extend camera bounds, not source geometry.
-        center_x, center_y = (bounds[0]+bounds[2])/2, (bounds[1]+bounds[3])/2
-        half_span = max(bounds[2]-bounds[0], bounds[3]-bounds[1])/2
-        bounds = (center_x-half_span, center_y-half_span, center_x+half_span, center_y+half_span)
-        view = make_view(source['positions'], render_resolution, yaw, bounds)
-        before = render_albedo(source, view)
-        source_lm, source_box, source_observation = detect_face(detector, mp, before['rgb'], 'Refined source head render',
-                                                                 mesh_render=True)
+        (full_view, full_render, full_observation, view, before,
+         source_lm, source_box, source_observation) = observe_source(detector, mp, source, render_resolution, yaw)
     segment_options = vision.ImageSegmenterOptions(base_options=base(segment_model), running_mode=vision.RunningMode.IMAGE,
                                                    output_confidence_masks=True, output_category_mask=False)
     with vision.ImageSegmenter.create_from_options(segment_options) as segmenter:
@@ -1448,4 +1455,218 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
         Image.fromarray(np.rint(texel_mask*255).clip(0, 255).astype(np.uint8)).save(encoded, format='PNG')
         files.append((projection_mask_png, encoded.getvalue()))
     _write_outputs(files)
+    return report
+
+
+# Face regions for `run_locate`, named from the subject's side (MediaPipe's
+# landmark 33 is the subject's right outer eye corner). Code, landmarks and the
+# dilation around their convex hull in eye spans; on overlap the lower code wins.
+REGIONS = (
+    (1, 'right_eye', (33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246), .12),
+    (2, 'left_eye', (263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466), .12),
+    (3, 'right_brow', (70, 63, 105, 66, 107, 55, 65, 52, 53, 46), .05),
+    (4, 'left_brow', (300, 293, 334, 296, 336, 285, 295, 282, 283, 276), .05),
+    (5, 'lips', FEATURES['lips'], .06),
+    (6, 'nose', (168, 6, 197, 195, 5, 4, 1, 19, 94, 2, 98, 97, 326, 327, 64, 294, 48, 278,
+                 115, 344, 220, 440, 45, 275, 129, 358), .04),
+)
+# Landmarks reported in model coordinates: outer/inner eye corners, nose tip,
+# mouth corners, upper/lower lip centre, chin, brow peaks.
+LOCATE_LANDMARKS = (33, 133, 362, 263, 1, 61, 291, 0, 17, 152, 105, 334)
+
+
+def region_image(landmarks, shape):
+    """Render-space region codes (0 = none) from the source landmarks."""
+    height, width = shape[:2]
+    points = landmarks[:, :2]*[width, height]
+    span = float(np.linalg.norm(points[263]-points[33]))
+    codes = np.zeros((height, width), dtype=np.uint8)
+    for code, _, ids, margin in sorted(REGIONS, reverse=True):
+        hull = Image.new('L', (width, height))
+        ImageDraw.Draw(hull).polygon(_hull(points[list(ids)]), fill=255)
+        inside = distance_transform_edt(np.asarray(hull) == 0) <= margin*span
+        codes[inside] = code
+    return codes, span
+
+
+def _surface_depth(rendered):
+    """Visible surface depth per pixel; an empty pixel takes the nearest within 2 pixels."""
+    from scipy.ndimage import grey_dilation
+    owned = rendered['owners'] >= 0
+    surface = np.where(owned, rendered['depth'], -np.inf)
+    return np.where(owned, surface, grey_dilation(surface, size=(5, 5)))
+
+
+def _vertex_pixels(view, shape):
+    height, width = shape[:2]
+    px = np.floor(view['xy'][:, 0]).astype(np.int64)
+    py = np.floor(view['xy'][:, 1]).astype(np.int64)
+    return px, py, (px >= 0) & (py >= 0) & (px < width) & (py < height)
+
+
+def label_vertices(view, rendered, codes, depth_window):
+    """Region code per vertex row: its render pixel's region, if it lies at most
+    `depth_window` model units behind the visible surface there.
+
+    Hidden vertices just behind the surface (eye sockets, the inside of a
+    mouth, lash flaps under the lid) are included; the back of the head is not.
+    A pixel without surface takes the nearest surface depth within 2 pixels.
+    """
+    z = view['depth']
+    px, py, inside = _vertex_pixels(view, codes.shape)
+    surface = _surface_depth(rendered)
+    labels = np.zeros(len(z), dtype=np.uint8)
+    rows = np.flatnonzero(inside)
+    near = z[rows] >= surface[py[rows], px[rows]] - depth_window
+    rows = rows[near]
+    labels[rows] = codes[py[rows], px[rows]]
+    return labels
+
+
+def _unproject(view, xy, depth):
+    x0, y0, x1, y1 = view['bounds']
+    resolution = view['resolution']
+    camera = np.c_[x0 + xy[:, 0]/resolution*(x1-x0), y1 - xy[:, 1]/resolution*(y1-y0), depth]
+    return camera @ view['rotation']
+
+
+def regions_glb(source, attributes, extras):
+    """The source GLB with extra float vertex attributes (one value per vertex
+    row) and `extras.glb_face_regions`; the original binary stays an exact prefix."""
+    doc = copy.deepcopy(source['gltf'])
+    binary = bytearray(source['binary'])
+    for name, column in attributes.items():
+        binary.extend(b'\0'*(-len(binary) % 4))
+        values = np.asarray(column, dtype='<f4')
+        doc['bufferViews'].append({'buffer': 0, 'byteOffset': len(binary), 'byteLength': values.nbytes, 'target': 34962})
+        binary.extend(values.tobytes())
+        doc['accessors'].append({'bufferView': len(doc['bufferViews'])-1, 'componentType': 5126,
+                                 'count': len(values), 'type': 'SCALAR',
+                                 'min': [float(values.min())], 'max': [float(values.max())]})
+        doc['meshes'][0]['primitives'][0]['attributes'][name] = len(doc['accessors'])-1
+    doc.setdefault('extras', {})['glb_face_regions'] = extras
+    doc['buffers'][0]['byteLength'] = len(binary)
+    encoded = json.dumps(doc, separators=(',', ':'), allow_nan=False).encode()
+    encoded += b' '*(-len(encoded) % 4)
+    payload = bytes(binary) + b'\0'*(-len(binary) % 4)
+    return (struct.pack('<4sII', b'glTF', 2, 28+len(encoded)+len(payload))
+            + struct.pack('<II', len(encoded), 0x4E4F534A)+encoded
+            + struct.pack('<II', len(payload), 0x004E4942)+payload)
+
+
+def _region_preview(rgb, codes, view, labels, visible):
+    colours = np.array([[0, 0, 0], [40, 120, 255], [0, 200, 255], [150, 80, 30], [220, 150, 60],
+                        [230, 30, 90], [60, 200, 60]], dtype=float)
+    image = rgb.astype(float)
+    tinted = codes > 0
+    image[tinted] = .55*image[tinted] + .45*colours[codes[tinted]]
+    canvas = Image.fromarray(np.rint(image).clip(0, 255).astype(np.uint8))
+    draw = ImageDraw.Draw(canvas)
+    # Labelled vertices: filled when seen in the render, hollow when hidden behind the surface.
+    for row in np.flatnonzero(labels):
+        x, y = view['xy'][row]
+        colour = tuple(int(c) for c in colours[labels[row]])
+        if visible[row]:
+            draw.point((x, y), fill=colour)
+        else:
+            draw.rectangle((x-1, y-1, x+1, y+1), outline=(255, 255, 255))
+    output = io.BytesIO()
+    canvas.save(output, format='PNG')
+    return output.getvalue()
+
+
+def run_locate(source_glb: Path, output_glb: Path, preview_png: Path, proof_json: Path, model_dir: Path,
+               render_resolution: int = 768, yaw: float = 0.0, depth_window: float = .3) -> dict:
+    """Label the face regions of every vertex; geometry, UVs and images stay byte-identical.
+
+    `depth_window` is the depth (in eye spans) behind the visible surface up to
+    which hidden vertices still belong to the region in front of them.
+    """
+    if not np.isfinite([yaw, depth_window]).all() or not -180 <= yaw <= 180 or not 0 <= depth_window <= 1:
+        raise FaceTextureError('yaw must be in [-180,180] degrees and depth_window in [0,1] eye spans')
+    if not isinstance(render_resolution, int) or not 256 <= render_resolution <= 2048:
+        raise FaceTextureError('Render resolution must be an integer from 256 to 2048')
+    source_glb = Path(source_glb)
+    outputs = [Path(output_glb), Path(preview_png), Path(proof_json)]
+    targets = [path.resolve() for path in outputs]
+    if len(set(targets)) != 3 or source_glb.resolve() in targets:
+        raise FaceTextureError('Output paths must be distinct and must not overwrite inputs')
+    face_model = Path(model_dir)/'face_landmarker.task'
+    if not face_model.is_file():
+        raise FaceTextureError('Missing local CPU model: '+str(face_model)+'; run python install.py')
+    source = read_source(source_glb)
+    import mediapipe as mp
+    from mediapipe.tasks import python
+    from mediapipe.tasks.python import vision
+    options = vision.FaceLandmarkerOptions(
+        base_options=python.BaseOptions(model_asset_path=str(face_model), delegate=python.BaseOptions.Delegate.CPU),
+        running_mode=vision.RunningMode.IMAGE, num_faces=2, min_face_detection_confidence=.5,
+        min_face_presence_confidence=.5, min_tracking_confidence=.5)
+    with vision.FaceLandmarker.create_from_options(options) as detector:
+        (full_view, _, full_observation, view, before,
+         landmarks, _, observation) = observe_source(detector, mp, source, render_resolution, yaw)
+    codes, span = region_image(landmarks, before['rgb'].shape)
+    x0, y0, x1, y1 = view['bounds']
+    model_per_pixel = (x1-x0)/render_resolution
+    span_model = span*model_per_pixel
+    labels = label_vertices(view, before, codes, depth_window*span_model)
+    # Hidden = behind the visible surface at its pixel by more than .02 eye
+    # spans plus the surface's depth change over two pixels (steep flanks).
+    px, py, inside = _vertex_pixels(view, codes.shape)
+    surface = _surface_depth(before)
+    finite = np.where(np.isfinite(surface), surface, np.nan)
+    gy, gx = np.gradient(finite)
+    slope = np.nan_to_num(np.hypot(gx, gy), nan=0.)
+    hidden = np.zeros(len(labels), dtype=bool)
+    rows = np.flatnonzero(inside)
+    tolerance = .02*span_model + 2*slope[py[rows], px[rows]]
+    hidden[rows] = view['depth'][rows] < surface[py[rows], px[rows]] - tolerance
+    # Depth behind the visible surface in eye spans, for labelled vertices only.
+    behind = np.zeros(len(labels), dtype=np.float64)
+    marked = rows[labels[rows] > 0]
+    behind[marked] = np.maximum(surface[py[marked], px[marked]] - view['depth'][marked], 0)/span_model
+    seen = ~hidden
+    pixels = landmarks[list(LOCATE_LANDMARKS), :2]*[render_resolution, render_resolution]
+    px = np.clip(np.floor(pixels).astype(int), 0, render_resolution-1)
+    depth = before['depth'][px[:, 1], px[:, 0]]
+    points = _unproject(view, pixels, depth)
+    regions = {name: {'code': code, 'vertices': int((labels == code).sum()),
+                      'hidden_vertices': int(((labels == code) & hidden).sum())}
+               for code, name, _, _ in REGIONS}
+    extras = {'version': 1, 'attribute': '_FACE_REGION', 'depth_attribute': '_FACE_DEPTH',
+              'depth_unit': 'eye spans behind the visible surface (0 outside the regions)', 'none': 0,
+              'regions': {name: value['code'] for name, value in regions.items()},
+              'eye_span_model_units': span_model, 'depth_window_eye_fraction': float(depth_window),
+              'landmarks_model': {str(index): (point.tolist() if np.isfinite(point).all() else None)
+                                  for index, point in zip(LOCATE_LANDMARKS, points)}}
+    attributes = {'_FACE_REGION': labels, '_FACE_DEPTH': behind}
+    output = regions_glb(source, attributes, extras)
+    doc, binary = parse_glb(output)
+    primitive = doc['meshes'][0]['primitives'][0]
+    original = source['primitive']
+    exact = (binary[:len(source['binary'])] == source['binary']
+             and {k: v for k, v in primitive['attributes'].items() if k not in attributes} == original['attributes']
+             and primitive.get('indices') == original.get('indices') and primitive.get('material') == original.get('material')
+             and all(doc.get(key) == source['gltf'].get(key) for key in ('nodes', 'scenes', 'scene', 'images', 'materials', 'textures'))
+             and all(np.array_equal(accessor_array(doc, binary, primitive['attributes'][name]), np.asarray(column, dtype='<f4'))
+                     for name, column in attributes.items()))
+    if not exact:
+        raise FaceTextureError('Internal append-only region export check failed')
+    report = {'schema_version': 1, 'status': 'face_regions_only',
+              'method': 'CPU MediaPipe landmarks on the orthographic head render; convex landmark hulls dilated per region; '
+                        'each vertex takes the region of its render pixel if it lies at most depth_window behind the visible surface',
+              'source_sha256': hashlib.sha256(source['raw']).hexdigest(), 'output_sha256': hashlib.sha256(output).hexdigest(),
+              'model_sha256': hashlib.sha256(face_model.read_bytes()).hexdigest(),
+              'vertex_rows': len(labels), 'labelled_vertices': int((labels > 0).sum()),
+              'geometry_unchanged': True, 'original_binary_prefix_exact': True,
+              'hidden_vertices': 'behind the visible surface at the vertex pixel by more than 0.02 eye spans plus its depth change over two pixels',
+              'regions': regions, 'region_margins_eye_fraction': {name: margin for _, name, _, margin in REGIONS},
+              'eye_span_render_pixels': span, 'source_full_observation': full_observation,
+              'source_observation': observation,
+              'camera': {'kind': 'orthographic albedo; Y-up; yaw=0 views from +Z', 'yaw_degrees': float(yaw),
+                         'head_bounds_xy': view['bounds'], 'full_bounds_xy': full_view['bounds'], 'resolution': render_resolution},
+              'extras': extras}
+    _write_outputs([(outputs[0], output),
+                    (outputs[1], _region_preview(before['rgb'], codes, view, labels, seen)),
+                    (outputs[2], (json.dumps(report, indent=2, allow_nan=False)+'\n').encode())])
     return report
