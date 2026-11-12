@@ -102,7 +102,7 @@ class BridgeTests(unittest.TestCase):
             return node.retexture(source or File3D(str(self.source)), image or self.image, 1.0, .18, 256, 0.0, **controls)
 
     def test_success_returns_native_outputs_from_worker_files(self):
-        """A completed worker yields FILE_3D, a 1xHxWx3 IMAGE and the proof text."""
+        """A completed worker yields FILE_3D, a 1xHxWx3 IMAGE, the proof text and the texel mask."""
         def worker(command, **kwargs):
             arguments = dict(zip(command, command[1:]))
             self.assertEqual(command[1:5], ["-E", "-s", "-X", "utf8"])
@@ -111,9 +111,14 @@ class BridgeTests(unittest.TestCase):
             Path(arguments["--output-glb"]).write_bytes(b"glTF output")
             Image.new("RGB", (6, 4), (10, 20, 30)).save(arguments["--comparison-png"])
             Path(arguments["--proof-json"]).write_text(json.dumps({"status": "face_texture_only"}), encoding="utf-8")
+            self.assertEqual(arguments["--seam-blend"], "true")
+            Image.fromarray(np.array([[0, 128, 255]], dtype=np.uint8)).save(arguments["--projection-mask-png"])
             return 0, "", ""
         result = self.run_node(worker)
-        glb, comparison, proof = result["result"]
+        glb, comparison, proof, mask = result["result"]
+        self.assertEqual(mask.shape, (1, 1, 3, 3))
+        np.testing.assert_allclose(mask.array[0, 0, :, 0], [0, 128/255, 1], rtol=1e-6)
+        np.testing.assert_array_equal(mask.array[..., 0], mask.array[..., 2])
         self.assertEqual(Path(glb.get_source()).read_bytes(), b"glTF output")
         self.assertEqual(comparison.shape, (1, 4, 6, 3))
         self.assertEqual(json.loads(proof)["status"], "face_texture_only")
@@ -121,11 +126,16 @@ class BridgeTests(unittest.TestCase):
 
     def test_optional_controls_forwarded_and_workflow_order(self):
         schema = self.bridge.GLBFaceRetexture.INPUT_TYPES()
-        controls = dict(light_balance=.5, tone_match=.75, brightness=.9, skin_recolor=.6)
+        controls = dict(light_balance=.5, tone_match=.75, brightness=.9, skin_recolor=.6, seam_blend=False)
         self.assertEqual(list(schema["optional"]), list(controls))
+        self.assertIs(schema["optional"]["seam_blend"][1]["default"], True)
         def worker(command, **kwargs):
             for name, value in controls.items():
-                self.assertEqual(float(command[command.index("--" + name.replace("_", "-"))+1]), value)
+                argument = command[command.index("--" + name.replace("_", "-"))+1]
+                if isinstance(value, bool):
+                    self.assertEqual(argument, "true" if value else "false")
+                else:
+                    self.assertEqual(float(argument), value)
             return 1, "", "checked controls"
         with self.assertRaisesRegex(RuntimeError, "checked controls"):
             self.run_node(worker, **controls)
@@ -134,6 +144,17 @@ class BridgeTests(unittest.TestCase):
         widgets = {**schema["required"], **schema["optional"]}
         defaults = [definition[1]["default"] for definition in widgets.values() if "default" in definition[1]]
         self.assertEqual(node["widgets_values"], defaults)
+
+    def test_missing_mask_is_an_error(self):
+        """A worker that skips the mask did not finish; the node must not return partial outputs."""
+        def worker(command, **kwargs):
+            arguments = dict(zip(command, command[1:]))
+            Path(arguments["--output-glb"]).write_bytes(b"glTF output")
+            Image.new("RGB", (6, 4)).save(arguments["--comparison-png"])
+            Path(arguments["--proof-json"]).write_text("{}", encoding="utf-8")
+            return 0, "", ""
+        with self.assertRaisesRegex(RuntimeError, "projection_mask.png"):
+            self.run_node(worker)
 
     def test_worker_failure_surfaces_its_error(self):
         """The worker's stderr is the user's error message; no output is returned."""

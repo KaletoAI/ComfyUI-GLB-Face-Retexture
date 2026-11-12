@@ -24,6 +24,8 @@ def main():
     parser.add_argument("--tone-match", type=float, default=0.0)
     parser.add_argument("--brightness", type=float, default=1.0)
     parser.add_argument("--skin-recolor", type=float, default=0.0)
+    parser.add_argument("--seam-blend", choices=("true", "false"), default="true")
+    parser.add_argument("--projection-mask-png", type=Path)
     arguments = parser.parse_args()
     package_dir = Path(__file__).resolve().parent
     repair = installer_command(package_dir)
@@ -53,6 +55,8 @@ def main():
             yaw=arguments.yaw,
             light_balance=arguments.light_balance, tone_match=arguments.tone_match, brightness=arguments.brightness,
             skin_recolor=arguments.skin_recolor,
+            seam_blend=arguments.seam_blend == "true",
+            projection_mask_png=arguments.projection_mask_png,
         )
     except ImportError as exc:
         print(f"GLBFaceRetexture CPU dependency unavailable in {sys.executable}: {exc}.\nRun: {repair}", file=sys.stderr)

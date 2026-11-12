@@ -119,6 +119,45 @@ class VisionInputTests(unittest.TestCase):
             self.assertEqual(source.read_bytes(), original)
 
 
+    def test_seam_blend_lowers_the_edge_step_and_writes_the_mask(self):
+        """A warm-shifted mesh skin: blending pulls the projected edge toward it; the mask is the blend amount."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.glb"
+            with Image.open(PORTRAIT) as image:
+                pixels = np.asarray(image.convert("RGB")).astype(float)
+            texture = io.BytesIO()
+            Image.fromarray((pixels * [1.15, .95, .8]).clip(0, 255).astype(np.uint8)).save(texture, format="PNG")
+            textured_grid(source, texture.getvalue(), mime="image/png")
+            runs = {}
+            for name, blend in (("off", False), ("on", True), ("again", True)):
+                outputs = [root / f"{name}.glb", root / f"{name}.png", root / f"{name}.json", root / f"{name}_mask.png"]
+                report = core.run_retexture(source, PORTRAIT, *outputs[:3], MODEL_DIR, render_resolution=256,
+                                            seam_blend=blend, projection_mask_png=outputs[3])
+                runs[name] = report, [path.read_bytes() for path in outputs]
+            off, on = runs["off"][0]["seam_blend"], runs["on"][0]["seam_blend"]
+            self.assertFalse(off["enabled"])
+            self.assertTrue(on["enabled"])
+            self.assertGreater(on["edge_pixels"], 0)
+            self.assertLess(on["render_delta_e"]["p50"], .8 * off["render_delta_e"]["p50"])
+            self.assertEqual(on["render_delta_e"]["samples"], off["render_delta_e"]["samples"])
+            # Deterministic, including the mask; the mask does not depend on the blend.
+            self.assertEqual(runs["on"][1], runs["again"][1])
+            self.assertEqual(runs["on"][1][3], runs["off"][1][3])
+            self.assertNotEqual(runs["on"][1][0], runs["off"][1][0])
+            with Image.open(root / "on_mask.png") as mask_image:
+                self.assertEqual(mask_image.mode, "L")
+                mask = np.asarray(mask_image)
+            doc, binary = core.parse_glb(runs["on"][1][0])
+            atlas, _ = core._material_atlas(doc, binary, doc["meshes"][0]["primitives"][1]["material"])
+            self.assertEqual(mask.shape, atlas.shape[:2])
+            # Painted texels below half a level quantise to 0.
+            self.assertLessEqual(int((mask > 0).sum()), runs["on"][0]["painted_texture_pixels"])
+            self.assertGreater(int((mask > 0).sum()), .9 * runs["on"][0]["painted_texture_pixels"])
+            self.assertEqual(mask.max(), 255)
+            self.assertTrue(((mask > 0) & (mask < 255)).any())
+
+
 def cyan_canvas(size=160):
     """The fixture portrait as saturated cyan skin, small on a light 768 px canvas."""
     with Image.open(PORTRAIT) as image:

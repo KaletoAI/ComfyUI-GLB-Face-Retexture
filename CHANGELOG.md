@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.0 — 2026-11-12
+
+- Add `seam_blend` (default on): a two-band seam blend at the projection edge. The photo keeps its detail, but within a band along the edge its low frequencies (σ 0.1 eye spans) are pulled toward the mesh skin just outside the edge. The pull is a per-channel linear gain, at most ×2/×½, measured on the outer feather and carried inward. It is full across the feather and fades to none at feather + 0.25 eye spans. Eyes, brows, lips and the inside of the face are untouched, and nothing changes where the outside is hair or background. Only texels the projection paints anyway are affected, so nothing reaches other UV islands or empty texture. Light and tone matching only evened out the average colour; on generated meshes the edge still showed a coloured band.
+- New fourth node output `projection_mask` (IMAGE) and worker option `--projection-mask-png`: the face atlas's per-texel blend amount as greyscale, 255 = projected, 0 = original.
+- The proof gains a `seam_blend` block. `render_delta_e` is the ΔE across the feather in the head render. `delta_e` is the ±3 texel ΔE along the texture mask within one UV island, also without the areas around eyes, brows and lips. On two UniForge3D characters `render_delta_e` p50/p95 fell from 9.0/13.3 to 7.0/11.4 and from 16.3/34.5 to 9.7/20.6.
+- `seam_blend` off gives the 1.4.4 GLB and comparison byte for byte; the proof only gains the measurement block. Output is deterministic for the same input.
+- Add synthetic tests for the seam field (edge match, untouched interior and features, hairline, determinism), the mask, the gain and the ΔE measurement, plus a real vision run on a warm-shifted mesh.
+
 ## 1.4.4 — 2026-11-09
 
 - Ignore a second "face" on body texture. On a full-body render (head about 60 px wide in the 768 px render) no face was found in the whole image, and the upper search crop reported the head plus a second face on the chest, so the job failed with `Source mesh render: multiple faces are unsupported`. When a view of the source mesh (full render or head re-render) now reports more than one face, each candidate is re-detected in its own face crop and kept only if a face appears there at the same nose position (within 0.35 outer-eye spans). The chest vanished in its own crop, the head was found again within 0.02 eye spans. Two confirmed faces in a render are still refused. The reference photo is unchanged: it refuses every second face, confirmed or not, so a hard-to-detect second person cannot slip through.

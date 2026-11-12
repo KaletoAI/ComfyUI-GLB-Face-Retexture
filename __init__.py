@@ -51,16 +51,21 @@ class GLBFaceRetexture:
                 "tone_match": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Pulls the photo face's overall skin colour and brightness toward the mesh's own face skin, so the projection blends into the surrounding texture without a seam. 0 = off."}),
                 "brightness": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.5, "step": 0.05, "tooltip": "Final brightness scale of the photo face before projection. 1 = unchanged."}),
                 "skin_recolor": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Recolours the mesh's own skin (face, neck, arms, hands — every skin-coloured texel of the original texture) toward the photo's skin tone, for meshes whose generator shifted the skin colour. Clothes and hair are left alone. 0 = off."}),
+                "seam_blend": ("BOOLEAN", {"default": True, "tooltip": "Blends the colour of the projected face into the surrounding mesh skin along the projection edge (low frequencies only, in a narrow band; eyes, brows and lips untouched). Off = the colour transition of 1.4.x, byte-identical, for comparison."}),
             }
         }
 
-    RETURN_TYPES = ("FILE_3D", "IMAGE", "STRING")
-    RETURN_NAMES = ("corrected_glb", "comparison", "proof_metrics")
+    RETURN_TYPES = ("FILE_3D", "IMAGE", "STRING", "IMAGE")
+    RETURN_NAMES = ("corrected_glb", "comparison", "proof_metrics", "projection_mask")
+    OUTPUT_TOOLTIPS = ("GLB with the original geometry and a private face texture.",
+                       "Reference photo, original mesh albedo and the result, side by side.",
+                       "Preservation and measurement report (JSON).",
+                       "Per-texel blend amount of the face atlas in texture space: white = projected photo, black = original texel, grey = blend.")
     FUNCTION = "retexture"
     CATEGORY = "3d/texture"
     DESCRIPTION = "Project a matching photo onto only the visible face texture; preserve the source GLB geometry and original assets. CPU worker runs in a separate process."
 
-    def retexture(self, source_glb, reference_image, strength, feather, render_resolution, yaw, light_balance=0.0, tone_match=0.0, brightness=1.0, skin_recolor=0.0):
+    def retexture(self, source_glb, reference_image, strength, feather, render_resolution, yaw, light_balance=0.0, tone_match=0.0, brightness=1.0, skin_recolor=0.0, seam_blend=True):
         repair = installer_command(PACKAGE_DIR)
         if not isinstance(source_glb, Types.File3D) or source_glb.format != "glb":
             raise ValueError("GLBFaceRetexture requires a static textured GLB from the native Load 3D node.")
@@ -91,6 +96,7 @@ class GLBFaceRetexture:
         output_path = work_dir / "GLBFaceRetexture.glb"
         comparison_path = work_dir / "comparison.png"
         proof_path = work_dir / "proof.json"
+        mask_path = work_dir / "projection_mask.png"
         command = [
             python, "-E", "-s", "-X", "utf8", str(PACKAGE_DIR / "worker.py"),
             "--source-glb", str(source_path), "--reference-image", str(reference_path),
@@ -100,6 +106,7 @@ class GLBFaceRetexture:
             "--render-resolution", str(render_resolution), "--yaw", str(yaw),
             "--light-balance", str(light_balance), "--tone-match", str(tone_match), "--brightness", str(brightness),
             "--skin-recolor", str(skin_recolor),
+            "--seam-blend", "true" if seam_blend else "false", "--projection-mask-png", str(mask_path),
         ]
         timeout = worker_timeout()
         try:
@@ -116,15 +123,19 @@ class GLBFaceRetexture:
         if returncode:
             details = stderr.strip() or stdout.strip() or "Worker produced no error details."
             raise RuntimeError(f"GLBFaceRetexture CPU worker failed (exit {returncode}):\n{details}")
-        for output in (output_path, comparison_path, proof_path):
+        for output in (output_path, comparison_path, proof_path, mask_path):
             if not output.is_file() or output.stat().st_size == 0:
                 raise RuntimeError(f"GLBFaceRetexture worker did not produce its required output: {output}")
         proof = json.loads(proof_path.read_text(encoding="utf-8"))
         with Image.open(comparison_path) as comparison_image:
             comparison = np.asarray(comparison_image.convert("RGB"), dtype=np.float32) / 255.0
         comparison_tensor = torch.from_numpy(comparison).unsqueeze(0)
+        with Image.open(mask_path) as mask_image:
+            mask = np.asarray(mask_image.convert("RGB"), dtype=np.float32) / 255.0
+        mask_tensor = torch.from_numpy(mask).unsqueeze(0)
         proof_text = json.dumps(proof, ensure_ascii=False, indent=2)
-        return {"ui": {"text": [proof_text]}, "result": (Types.File3D(str(output_path)), comparison_tensor, proof_text)}
+        return {"ui": {"text": [proof_text]},
+                "result": (Types.File3D(str(output_path)), comparison_tensor, proof_text, mask_tensor)}
 
 
 NODE_CLASS_MAPPINGS = {"GLBFaceRetexture": GLBFaceRetexture}
