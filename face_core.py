@@ -28,6 +28,14 @@ FACE_OVAL = (10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
              397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
              172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109)
 STABLE = (33, 133, 362, 263, 168, 1, 61, 291, 152)
+# Eyes with brows and the outer lip contour: the seam blend never touches them.
+FEATURES = {
+    'left_eye_brow': (33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246,
+                      70, 63, 105, 66, 107, 55, 65, 52, 53, 46),
+    'right_eye_brow': (263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466,
+                       300, 293, 334, 296, 336, 285, 295, 282, 283, 276),
+    'lips': (61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185),
+}
 _DTYPES = {5120: 'i1', 5121: 'u1', 5122: '<i2', 5123: '<u2', 5125: '<u4', 5126: '<f4'}
 _WIDTHS = {'SCALAR': 1, 'VEC2': 2, 'VEC3': 3, 'VEC4': 4}
 
@@ -575,7 +583,7 @@ def semantic_face_mask(segmenter, mp, rgb, landmarks, box, feather):
     mask = (oval_weight*semantic).astype(np.float32)
     if (mask > .25).sum() < 16:
         raise FaceTextureError('Face semantics contain no usable skin region')
-    return mask, {'skin_classes': [2, 3], 'hair_class': 1, 'face_oval_landmarks': list(FACE_OVAL),
+    return mask, semantic.astype(np.float32), {'skin_classes': [2, 3], 'hair_class': 1, 'face_oval_landmarks': list(FACE_OVAL),
                   'usable_face_pixels': int((mask > .25).sum()), 'feather_eye_fraction': float(feather)}
 
 
@@ -809,7 +817,167 @@ def select_triangles(source, rendered, source_mask, photo_mask, affine):
     return selected
 
 
-def paint_atlas(source, selected, rendered, source_mask, photo, photo_mask, affine, strength):
+def _hull(points):
+    """Convex hull (monotone chain), counter-clockwise, without repeated end point."""
+    points = sorted(map(tuple, np.asarray(points, dtype=float)))
+    def half(sequence):
+        chain = []
+        for point in sequence:
+            while len(chain) >= 2 and ((chain[-1][0]-chain[-2][0])*(point[1]-chain[-2][1])
+                                       - (chain[-1][1]-chain[-2][1])*(point[0]-chain[-2][0])) <= 0:
+                chain.pop()
+            chain.append(point)
+        return chain
+    lower, upper = half(points), half(reversed(points))
+    return lower[:-1] + upper[:-1]
+
+
+def _smoothstep(t):
+    t = np.clip(t, 0, 1)
+    return t*t*(3-2*t)
+
+
+def feature_distance(photo_lm, photo_shape, affine, render_shape):
+    """Render-space distance to the photo's eyes+brows and lips, in eye spans.
+
+    The photo landmarks are mapped through the inverse registration, i.e. to
+    where the projected features land on the source render.
+    """
+    height, width = render_shape[:2]
+    linear_map, offset = np.asarray(affine[:2], dtype=float), np.asarray(affine[2], dtype=float)
+    photo_points = photo_lm[:, :2]*[photo_shape[1], photo_shape[0]]
+    landmarks = (photo_points-offset) @ np.linalg.inv(linear_map)
+    span = float(np.linalg.norm(landmarks[263]-landmarks[33]))
+    features = Image.new('L', (width, height))
+    draw = ImageDraw.Draw(features)
+    for ids in FEATURES.values():
+        draw.polygon(_hull(landmarks[list(ids)]), fill=255)
+    return distance_transform_edt(np.asarray(features) == 0)/span, span
+
+
+def _render_mask(source_mask, photo_mask, affine, owners):
+    """Projection amount (without strength) for every render pixel."""
+    height, width = owners.shape
+    yy, xx = np.mgrid[:height, :width]
+    screen = np.c_[xx.ravel()+.5, yy.ravel()+.5]
+    photo_xy = np.c_[screen, np.ones(len(screen))] @ affine
+    return (source_mask*_sample(photo_mask, photo_xy).reshape(height, width)*(owners >= 0)).clip(0, 1)
+
+
+def render_seam_delta_e(rgb, inside, source_skin, owners, distance, span, feather):
+    """Colour step across the projection's skin edge as a viewer sees it in the render.
+
+    Edge pixels are projected pixels (amount > .02) next to unprojected owned
+    mesh skin, at least .15 eye spans from eyes, brows and lips. Per edge pixel
+    the mean CIELAB colour of the fully projected pixels (amount > .9) within
+    feather + .05 eye spans is compared with that of the unprojected skin within
+    .05 eye spans (box windows), i.e. across the whole feather ramp.
+    """
+    from scipy.ndimage import uniform_filter
+    surface = owners >= 0
+    outside = surface & (inside <= .02) & (np.asarray(source_skin) > .5)
+    full = surface & (inside > .9) & (distance > 0)
+    edge = surface & (inside > .02) & (distance >= .15)
+    near = np.zeros_like(outside)
+    near[1:] |= outside[:-1]; near[:-1] |= outside[1:]; near[:, 1:] |= outside[:, :-1]; near[:, :-1] |= outside[:, 1:]
+    edge &= near
+    lab = _srgb_to_lab(rgb)
+    def means(flags, radius):
+        size = 2*int(round(radius))+1
+        mass = uniform_filter(flags.astype(np.float64), size, mode='constant')
+        total = np.stack([uniform_filter(lab[..., c]*flags, size, mode='constant') for c in range(3)], axis=-1)
+        return total/np.maximum(mass, 1e-12)[..., None], mass > 0
+    inner, has_inner = means(full, (feather+.05)*span)
+    outer, has_outer = means(outside, .05*span)
+    valid = edge & has_inner & has_outer
+    if not valid.any():
+        return {'samples': 0}
+    delta = np.linalg.norm(inner[valid]-outer[valid], axis=1)
+    return {'metric': 'CIE76 delta E, render: fully projected pixels within feather+.05 eye spans vs unprojected mesh skin within .05 eye spans',
+            'samples': int(valid.sum()), 'p50': float(np.percentile(delta, 50)),
+            'p95': float(np.percentile(delta, 95)), 'max': float(delta.max())}
+
+
+# Seam blend geometry in eye spans of the render: low-pass sigma, band end beyond
+# the feather, and the feature margin (gain one, then full band weight).
+SEAM_SIGMA, SEAM_BAND, SEAM_FEATURE_MARGIN = .1, .25, (.03, .15)
+# Largest per-channel gain, and the smoothing of the carried step along the edge.
+SEAM_MAX_GAIN, SEAM_CARRY_SIGMA = 2., .25
+
+
+def seam_field(surface_rgb, owners, source_mask, source_skin, photo, photo_mask, photo_lm, affine, feather):
+    """Per-pixel log gain (render space, linear light) that removes the colour step at the mask edge.
+
+    Two-band blend: the photo keeps its own detail, but within a band along the
+    projection edge its low frequencies are pulled to those of the mesh skin just
+    outside the edge. The step is measured on the outer feather ramp from two
+    normalised low passes: the outside one sees only owned mesh skin outside the
+    mask (no hair, background or another surface), the inside one only valid
+    photo skin outside eyes, brows and lips. Each band pixel takes the step of
+    its nearest edge pixel (lightly smoothed). The gain is full across the
+    feather and fades to one at feather + SEAM_BAND eye spans; it is one near
+    eyes, brows and lips. Where the outside is not skin (e.g. a hairline) the
+    step is zero. The gain is applied only to projected texels, so it cannot
+    bleed into other UV islands or empty texture.
+    """
+    height, width = surface_rgb.shape[:2]
+    yy, xx = np.mgrid[:height, :width]
+    screen = np.c_[xx.ravel()+.5, yy.ravel()+.5]
+    photo_xy = np.c_[screen, np.ones(len(screen))] @ affine
+    coords = [photo_xy[:, 1]-.5, photo_xy[:, 0]-.5]
+    photo = np.asarray(photo, dtype=np.float64)
+    warped = np.stack([map_coordinates(photo[:, :, channel], coords, order=1, mode='nearest')
+                       for channel in range(3)], axis=1).reshape(height, width, 3)
+    surface = owners >= 0
+    inside = _render_mask(source_mask, photo_mask, affine, owners)
+    distance, span = feature_distance(photo_lm, photo_mask.shape, affine, surface_rgb.shape)
+    features = distance == 0
+    low_margin, high_margin = SEAM_FEATURE_MARGIN
+    protection = _smoothstep((distance-low_margin)/(high_margin-low_margin))
+    sigma = max(1., SEAM_SIGMA*span)
+    outside_weight = surface*np.asarray(source_skin, dtype=np.float64)*(1-inside)
+    inside_weight = inside*~features
+    def lowpass(values, weight):
+        mass = gaussian_filter(weight, sigma, mode='constant')
+        mean = np.stack([gaussian_filter(values[..., channel]*weight, sigma, mode='constant')
+                         for channel in range(3)], axis=-1)/np.maximum(mass, 1e-12)[..., None]
+        return mean, np.clip(mass/.1, 0, 1)
+    outside_low, outside_support = lowpass(_srgb_to_linear(surface_rgb), outside_weight)
+    inside_low, inside_support = lowpass(_srgb_to_linear(warped), inside_weight)
+    limit = math.log(SEAM_MAX_GAIN)
+    step = np.log(np.maximum(outside_low, 1e-4)/np.maximum(inside_low, 1e-4)).clip(-limit, limit)
+    step *= (outside_support*inside_support)[..., None]
+    edge_distance = distance_transform_edt(inside > .02)
+    feather_px = max(1., feather*span)
+    projected = inside > 0
+    edge = projected & (edge_distance <= max(1., .5*feather_px))
+    if not edge.any():
+        return np.zeros((height, width, 3), dtype=np.float32), {'edge_pixels': 0}
+    _, (ny, nx) = distance_transform_edt(~edge, return_indices=True)
+    carried = step[ny, nx]*projected[..., None]
+    carry = max(1., SEAM_CARRY_SIGMA*span)
+    mass = gaussian_filter(projected.astype(np.float64), carry, mode='constant')
+    carried = np.stack([gaussian_filter(carried[..., c], carry, mode='constant') for c in range(3)], axis=-1)
+    carried /= np.maximum(mass, 1e-12)[..., None]
+    band = 1-_smoothstep((edge_distance-feather_px)/(SEAM_BAND*span))
+    weight = band*protection*projected
+    field = (carried*weight[..., None]).astype(np.float32)
+    report = {'method': 'two-band seam blend in render space; low frequencies matched to outside mesh skin',
+              'sigma_eye_fraction': SEAM_SIGMA, 'carry_sigma_eye_fraction': SEAM_CARRY_SIGMA,
+              'max_gain': SEAM_MAX_GAIN, 'band_eye_fraction_beyond_feather': SEAM_BAND,
+              'feature_margin_eye_fraction': list(SEAM_FEATURE_MARGIN), 'render_eye_span_pixels': span,
+              'edge_pixels': int(edge.sum()),
+              'edge_mean_abs_log_gain': float(np.abs(field[edge]).mean()),
+              'max_abs_log_gain': float(np.abs(field).max())}
+    return field, report
+
+
+def paint_atlas(source, selected, rendered, source_mask, photo, photo_mask, affine, strength, seam=None, with_mask=False):
+    """Blend the registered photo into a copy of the atlas.
+
+    `seam` is an optional render-space log gain from `seam_field`; `with_mask`
+    also returns the per-texel blend amount (0 = original texel).
+    """
     atlas = source['atlas'].copy()
     original = source['atlas']
     height, width = atlas.shape[:2]
@@ -851,18 +1019,21 @@ def paint_atlas(source, selected, rendered, source_mask, photo, photo_mask, affi
         keep = visible & (amount > 1e-5)
         keys = points[keep, 1]*width + points[keep, 0]
         best = _winners(keys, amount[keep], face[keep])
-        parts.append((keys[best], amount[keep][best], face[keep][best], photo_xy[keep][best]))
+        parts.append((keys[best], amount[keep][best], face[keep][best], photo_xy[keep][best], screen[keep][best]))
     if not parts:
         raise FaceTextureError('Face projection covers no visible source atlas texels')
-    keys, amount, face, photo_xy = (np.concatenate(column) for column in zip(*parts))
+    keys, amount, face, photo_xy, screen = (np.concatenate(column) for column in zip(*parts))
     best = _winners(keys, amount, face)
-    keys, amount, photo_xy = keys[best], amount[best], photo_xy[best]
+    keys, amount, photo_xy, screen = keys[best], amount[best], photo_xy[best], screen[best]
     if not len(keys):
         raise FaceTextureError('Face projection covers no visible source atlas texels')
     py, px = np.divmod(keys, width)
     coords = [photo_xy[:, 1]-.5, photo_xy[:, 0]-.5]
     photo = photo.astype(np.float64)
     rgb = np.stack([map_coordinates(photo[:, :, channel], coords, order=1, mode='nearest') for channel in range(3)], axis=1)
+    if seam is not None:
+        gain = np.exp(np.stack([_sample(seam[:, :, channel], screen) for channel in range(3)], axis=1))
+        rgb = _linear_to_srgb(np.minimum(_srgb_to_linear(rgb)*gain, 1))
     factor = source['factor'][:3]
     clipped = np.zeros(len(keys), dtype=bool)
     if not np.all(factor == 1):
@@ -887,12 +1058,109 @@ def paint_atlas(source, selected, rendered, source_mask, photo, photo_mask, affi
         raise FaceTextureError('Projection changed no texture pixels; no corrected output was produced')
     output = io.BytesIO()
     Image.fromarray(atlas).save(output, format='PNG')
-    return output.getvalue(), {'edited_texture_pixels': int(changed.sum()),
+    report = {'edited_texture_pixels': int(changed.sum()),
                                'painted_texture_pixels': int(covered.sum()),
                                'gutter_pixels': int(gutter.sum()), 'gutter_width_pixels': 4,
                                'factor_clipped_texture_pixels': int(clipped.sum()),
                                'atlas_size': [width, height],
                                'scalar_base_color_factor': source['factor'].tolist()}
+    if not with_mask:
+        return output.getvalue(), report
+    mask = np.zeros((height, width), dtype=np.float32)
+    mask[py, px] = amount
+    return output.getvalue(), report, {'mask': mask, 'texels': (py, px), 'screen': screen}
+
+
+def _srgb_to_lab(rgb):
+    """CIE L*a*b* (D65) of 8-bit sRGB values."""
+    xyz = _srgb_to_linear(rgb) @ np.array([[.4124564, .3575761, .1804375],
+                                           [.2126729, .7151522, .0721750],
+                                           [.0193339, .1191920, .9503041]]).T
+    xyz = xyz/[.95047, 1., 1.08883]
+    f = np.where(xyz > (6/29)**3, np.cbrt(xyz), xyz/(3*(6/29)**2)+4/29)
+    return np.stack((116*f[..., 1]-16, 500*(f[..., 0]-f[..., 1]), 200*(f[..., 1]-f[..., 2])), axis=-1)
+
+
+def seam_delta_e(source, selected, body_atlas, face_atlas, mask, radius=3, exclude=None):
+    """Colour step across the projection edge in texture space, as Anima measures it.
+
+    The mask is quantised like the PNG (inside = level > 0). Every inside texel
+    with a 4-neighbour outside texel of the same UV island is a boundary sample;
+    its inside and outside means are taken over a (2*radius+1)^2 window, each
+    only from texels of that island, outside ones only where a triangle covers
+    the texel. Colours are what a viewer samples: the face atlas under selected
+    triangles, the body atlas elsewhere. Islands are vertex-connected triangles.
+    `exclude` (texture-sized bool) additionally reports the samples whose inside
+    texel is not excluded.
+    """
+    height, width = mask.shape
+    painted = np.rint(np.asarray(mask, dtype=np.float64)*255) > 0
+    if not painted.any():
+        return {'samples': 0}
+    ys, xs = np.nonzero(painted)
+    margin = radius+2
+    y0, y1 = max(0, ys.min()-margin), min(height, ys.max()+margin+1)
+    x0, x1 = max(0, xs.min()-margin), min(width, xs.max()+margin+1)
+    rh, rw = y1-y0, x1-x0
+    triangles = source['triangles']
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    count = int(triangles.max())+1
+    edges = np.r_[triangles[:, [0, 1]], triangles[:, [1, 2]]]
+    graph = coo_matrix((np.ones(len(edges), dtype=np.int8), (edges[:, 0], edges[:, 1])), shape=(count, count))
+    labels = connected_components(graph, directed=False)[1][triangles[:, 0]]
+    tex = source['uv'][triangles]*[width, height]-.5
+    near = np.flatnonzero((tex[..., 0].max(axis=1) >= x0-1) & (tex[..., 0].min(axis=1) <= x1)
+                          & (tex[..., 1].max(axis=1) >= y0-1) & (tex[..., 1].min(axis=1) <= y1))
+    island = np.full((rh, rw), -1, dtype=np.int64)
+    chosen = np.zeros((rh, rw), dtype=bool)
+    parts = []
+    for local, points, _ in _raster_batch(tex[near]-[x0, y0], rw, rh, 0):
+        keys = points[:, 1]*rw + points[:, 0]
+        keep = _winners(keys, np.zeros(len(keys)), near[local])
+        parts.append((keys[keep], near[local][keep]))
+    if parts:
+        keys, tri = (np.concatenate(column) for column in zip(*parts))
+        keep = _winners(keys, np.zeros(len(keys)), tri)
+        py, px = np.divmod(keys[keep], rw)
+        island[py, px] = labels[tri[keep]]
+        chosen[py, px] = np.asarray(selected)[tri[keep]]
+    shown = np.where(chosen[..., None], face_atlas[y0:y1, x0:x1, :3], body_atlas[y0:y1, x0:x1, :3])
+    lab = _srgb_to_lab(shown)
+    inside = painted[y0:y1, x0:x1] & (island >= 0)
+    outside = ~painted[y0:y1, x0:x1] & (island >= 0)
+    padded = lambda a, value: np.pad(a, radius, constant_values=value)
+    island_p, inside_p, outside_p = padded(island, -1), padded(inside, False), padded(outside, False)
+    lab_p = np.pad(lab, ((radius, radius), (radius, radius), (0, 0)))
+    def window(dy, dx, array):
+        return array[radius+dy:radius+dy+rh, radius+dx:radius+dx+rw]
+    boundary = np.zeros((rh, rw), dtype=bool)
+    for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+        boundary |= inside & window(dy, dx, outside_p) & (window(dy, dx, island_p) == island)
+    sums = {True: np.zeros((rh, rw, 3)), False: np.zeros((rh, rw, 3))}
+    counts = {True: np.zeros((rh, rw)), False: np.zeros((rh, rw))}
+    for dy in range(-radius, radius+1):
+        for dx in range(-radius, radius+1):
+            same = window(dy, dx, island_p) == island
+            for side, flags in ((True, inside_p), (False, outside_p)):
+                use = same & window(dy, dx, flags) & boundary
+                sums[side][use] += window(dy, dx, lab_p)[use]
+                counts[side][use] += 1
+    valid = boundary & (counts[True] > 0) & (counts[False] > 0)
+    delta = np.zeros((rh, rw))
+    delta[valid] = np.linalg.norm(sums[True][valid]/counts[True][valid, None]
+                                  - sums[False][valid]/counts[False][valid, None], axis=1)
+    def stats(use):
+        if not use.any():
+            return {'samples': 0}
+        values = delta[use]
+        return {'samples': int(use.sum()), 'p50': float(np.percentile(values, 50)),
+                'p95': float(np.percentile(values, 95)), 'max': float(values.max())}
+    report = {'metric': 'CIE76 delta E of inside/outside window means per boundary texel; same UV island',
+              'window_radius_texels': radius, **stats(valid)}
+    if exclude is not None:
+        report['outside_features'] = stats(valid & ~np.asarray(exclude)[y0:y1, x0:x1])
+    return report
 
 
 def partition_glb(source, selected, atlas_png, body_atlas_png=None):
@@ -1011,8 +1279,15 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
                   comparison_png: Path, proof_json: Path, model_dir: Path,
                   strength: float = 1.0, feather: float = .18,
                   render_resolution: int = 768, yaw: float = 0.0,
-                  light_balance: float = 0.0, tone_match: float = 0.0, brightness: float = 1.0, skin_recolor: float = 0.0) -> dict:
-    """Observe, register, paint and append a private face texture; never deform."""
+                  light_balance: float = 0.0, tone_match: float = 0.0, brightness: float = 1.0, skin_recolor: float = 0.0,
+                  seam_blend: bool = True, projection_mask_png: Path | None = None) -> dict:
+    """Observe, register, paint and append a private face texture; never deform.
+
+    `projection_mask_png`, if given, receives the per-texel blend amount of the
+    face atlas as 8-bit greyscale (255 = projected, 0 = original texel).
+    """
+    if not isinstance(seam_blend, bool):
+        raise FaceTextureError('seam_blend must be true or false')
     _validate_photo_controls(light_balance, tone_match, brightness)
     if not np.isfinite(skin_recolor) or not 0 <= skin_recolor <= 1:
         raise FaceTextureError('skin_recolor must be finite and in [0,1]')
@@ -1022,8 +1297,12 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
         raise FaceTextureError('Render resolution must be an integer from 256 to 2048')
     source_glb, reference_image = Path(source_glb), Path(reference_image)
     output_glb, comparison_png, proof_json = Path(output_glb), Path(comparison_png), Path(proof_json)
-    targets = [p.resolve() for p in (output_glb, comparison_png, proof_json)]
-    if len(set(targets)) != 3 or any(p in (source_glb.resolve(), reference_image.resolve()) for p in targets):
+    outputs = [output_glb, comparison_png, proof_json]
+    if projection_mask_png is not None:
+        projection_mask_png = Path(projection_mask_png)
+        outputs.append(projection_mask_png)
+    targets = [p.resolve() for p in outputs]
+    if len(set(targets)) != len(targets) or any(p in (source_glb.resolve(), reference_image.resolve()) for p in targets):
         raise FaceTextureError('Output paths must be distinct and must not overwrite inputs')
     face_model = Path(model_dir)/'face_landmarker.task'
     segment_model = Path(model_dir)/'selfie_multiclass.tflite'
@@ -1064,8 +1343,8 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
     segment_options = vision.ImageSegmenterOptions(base_options=base(segment_model), running_mode=vision.RunningMode.IMAGE,
                                                    output_confidence_masks=True, output_category_mask=False)
     with vision.ImageSegmenter.create_from_options(segment_options) as segmenter:
-        source_mask, source_semantics = semantic_face_mask(segmenter, mp, before['rgb'], source_lm, source_box, feather)
-        photo_mask, photo_semantics = semantic_face_mask(segmenter, mp, photo, photo_lm, photo_box, feather)
+        source_mask, source_skin, source_semantics = semantic_face_mask(segmenter, mp, before['rgb'], source_lm, source_box, feather)
+        photo_mask, _, photo_semantics = semantic_face_mask(segmenter, mp, photo, photo_lm, photo_box, feather)
         if skin_recolor:
             full_skin, full_hair = semantic_skin(segmenter, mp, full_render['rgb'])
             full_skin = _resize(full_skin, render_resolution, render_resolution, True)
@@ -1086,7 +1365,19 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
         before['rgb'], source_mask, source_skin_gain=skin_report.get('gain_rgb'))
     affine, registration = register_faces(source_lm, photo_lm, before['rgb'].shape, photo.shape)
     selected = select_triangles(source, before, source_mask, photo_mask, affine)
-    atlas_png, pixels = paint_atlas(paint_source, selected, before, source_mask, photo, photo_mask, affine, strength)
+    seam, seam_report = None, {'enabled': False}
+    if seam_blend:
+        seam, seam_report = seam_field(expected_body['rgb'], before['owners'], source_mask, source_skin,
+                                       photo, photo_mask, photo_lm, affine, feather)
+        seam_report = {'enabled': True, **seam_report}
+    atlas_png, pixels, painted = paint_atlas(paint_source, selected, before, source_mask, photo, photo_mask,
+                                             affine, strength, seam=seam, with_mask=True)
+    texel_mask = painted['mask']
+    # Texels whose projection lands within .15 eye spans of the photo's eyes,
+    # brows or lips: their mask edges are eye sockets and lids, not skin seams.
+    distance, span = feature_distance(photo_lm, photo.shape, affine, before['rgb'].shape)
+    feature_texels = np.zeros(texel_mask.shape, dtype=bool)
+    feature_texels[painted['texels']] = _sample(distance, painted['screen'], order=0) < .15
     output = partition_glb(source, selected, atlas_png, body_atlas_png=body_atlas_png)
     doc, binary = parse_glb(output)
     original_doc = source['gltf']
@@ -1113,6 +1404,11 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
     changed_render = np.any(before['rgb'] != after['rgb'], axis=2)
     if not changed_render.any():
         raise FaceTextureError('The corrected texture has no visible effect in the actual source render')
+    seam_report['delta_e'] = seam_delta_e(source, selected, emitted_atlases[0], emitted_atlases[1], texel_mask,
+                                          exclude=feature_texels)
+    seam_report['delta_e']['feature_margin_eye_fraction'] = .15
+    seam_report['render_delta_e'] = render_seam_delta_e(after['rgb'], _render_mask(source_mask, photo_mask, affine, before['owners']),
+                                                        source_skin, before['owners'], distance, span, feather)
     protected = (before['owners'] >= 0) & ~selected[np.maximum(before['owners'], 0)]
     protected_changes = int((np.any(expected_body['rgb'] != after['rgb'], axis=2) & protected).sum())
     if protected_changes:
@@ -1136,7 +1432,7 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
         'source_semantics': source_semantics, 'reference_semantics': photo_semantics,
         'camera': {'kind': 'orthographic albedo; Y-up; yaw=0 views from +Z', 'yaw_degrees': float(yaw),
                    'head_bounds_xy': view['bounds'], 'full_bounds_xy': full_view['bounds'], 'resolution': render_resolution},
-        'strength': float(strength), **pixels,
+        'strength': float(strength), **pixels, 'seam_blend': seam_report,
         'limitations': ['Planar affine does not undo photographic perspective or expression differences.',
                         'Landmarks and semantic probabilities are observations, not anatomical reconstruction.',
                         'No vertex positions, UVs, normals, tangents or original image bytes are changed.']}
@@ -1144,7 +1440,12 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
         report['skin_recolor'] = skin_report
     if photo_adjust:
         report['photo_adjust'] = photo_adjust
-    _write_outputs([(output_glb, output),
-                    (comparison_png, _comparison(photo, before['rgb'], after['rgb'], adjusted=bool(photo_adjust), recoloured=bool(skin_recolor))),
-                    (proof_json, (json.dumps(report, indent=2, allow_nan=False)+'\n').encode())])
+    files = [(output_glb, output),
+             (comparison_png, _comparison(photo, before['rgb'], after['rgb'], adjusted=bool(photo_adjust), recoloured=bool(skin_recolor))),
+             (proof_json, (json.dumps(report, indent=2, allow_nan=False)+'\n').encode())]
+    if projection_mask_png is not None:
+        encoded = io.BytesIO()
+        Image.fromarray(np.rint(texel_mask*255).clip(0, 255).astype(np.uint8)).save(encoded, format='PNG')
+        files.append((projection_mask_png, encoded.getvalue()))
+    _write_outputs(files)
     return report
