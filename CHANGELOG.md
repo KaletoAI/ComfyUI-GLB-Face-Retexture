@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.0 — 2026-11-12
+
+- New node **GLB Face Regions (Locate Only)** (`GLBFaceRegions`; worker `--locate`, `--preview-png`, `--depth-window`). It labels every vertex from MediaPipe landmarks of the head render: right/left eye with lid rim, right/left brow, lips and nose (`_FACE_REGION` 1–6, 0 = none). Hidden vertices up to `depth_window` (default 0.3 eye spans) behind the visible surface are included, such as eye sockets, the inside of the mouth and lash flaps. `_FACE_DEPTH` gives their distance behind the surface in eye spans. No photo is needed and no vertex moves: geometry, UVs, vertex order, images and materials stay byte-identical, and the original binary is an exact prefix.
+- `extras.glb_face_regions` in the output GLB carries the legend, the eye span in model units and twelve landmarks in scene coordinates, so a consumer needs nothing but the GLB. The proof adds per-region counts; the preview tints the regions.
+- On UniForge3D characters (Kai, Kira, Kira's raw mesh with lash flaps) 1,600–3,100 vertices are labelled in about 2 s. A large share lies more than 0.02 eye spans behind the visible skin: these meshes carry inner layers under the face.
+- The retexture node is unchanged (byte-identical output); its head location is shared with the new node.
+
 ## 1.5.0 — 2026-11-12
 
 - Add `seam_blend` (default on): a two-band seam blend at the projection edge. The photo keeps its detail, but within a band along the edge its low frequencies (σ 0.1 eye spans) are pulled toward the mesh skin just outside the edge. The pull is a per-channel linear gain, at most ×2/×½, measured on the outer feather and carried inward. It is full across the feather and fades to none at feather + 0.25 eye spans. Eyes, brows, lips and the inside of the face are untouched, and nothing changes where the outside is hair or background. Only texels the projection paints anyway are affected, so nothing reaches other UV islands or empty texture. Light and tone matching only evened out the average colour; on generated meshes the edge still showed a coloured band.

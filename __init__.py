@@ -66,29 +66,11 @@ class GLBFaceRetexture:
     DESCRIPTION = "Project a matching photo onto only the visible face texture; preserve the source GLB geometry and original assets. CPU worker runs in a separate process."
 
     def retexture(self, source_glb, reference_image, strength, feather, render_resolution, yaw, light_balance=0.0, tone_match=0.0, brightness=1.0, skin_recolor=0.0, seam_blend=True):
-        repair = installer_command(PACKAGE_DIR)
-        if not isinstance(source_glb, Types.File3D) or source_glb.format != "glb":
-            raise ValueError("GLBFaceRetexture requires a static textured GLB from the native Load 3D node.")
+        _source_path(source_glb, None)
         if reference_image.ndim != 4 or reference_image.shape[0] != 1 or reference_image.shape[-1] != 3:
             raise ValueError("GLBFaceRetexture requires exactly one RGB reference image, not an image batch.")
-
-        python = str(worker_python(PACKAGE_DIR))
-        model_dir = PACKAGE_DIR / "models"
-        for filename, _, _ in MODELS:
-            if not (model_dir / filename).is_file():
-                raise RuntimeError(f"GLBFaceRetexture is missing {model_dir / filename}. Run: {repair}")
-
-        folder_paths_temp = Path(folder_paths.get_temp_directory())
-        folder_paths_temp.mkdir(parents=True, exist_ok=True)
-        work_dir = Path(tempfile.mkdtemp(prefix="glb_face_retexture_", dir=folder_paths_temp))
-        source = source_glb.get_source()
-        if isinstance(source, str):
-            source_path = Path(source).resolve()
-        else:
-            source_path = work_dir / "source.glb"
-            source_glb.save_to(str(source_path))
-        if not source_path.is_file():
-            raise ValueError(f"GLBFaceRetexture source GLB does not exist: {source_path}")
+        python, repair, model_dir, work_dir = _prepare()
+        source_path = _source_path(source_glb, work_dir)
 
         reference_path = work_dir / "reference.png"
         pixels = reference_image[0].detach().cpu().numpy()
@@ -108,35 +90,110 @@ class GLBFaceRetexture:
             "--skin-recolor", str(skin_recolor),
             "--seam-blend", "true" if seam_blend else "false", "--projection-mask-png", str(mask_path),
         ]
-        timeout = worker_timeout()
-        try:
-            # Cancelling the prompt in ComfyUI raises here and kills the worker.
-            returncode, stdout, stderr = run_worker(
-                command, cwd=PACKAGE_DIR, env=worker_environment(), log_dir=work_dir, timeout=timeout,
-                check=comfy.model_management.throw_exception_if_processing_interrupted,
-            )
-        except OSError as exc:
-            raise RuntimeError(f"GLBFaceRetexture could not start the CPU worker ({python}): {exc}. Run: {repair}") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(f"GLBFaceRetexture CPU worker exceeded {timeout:g} s and was stopped. "
-                               "Lower render_resolution or raise GLB_FACE_RETEXTURE_TIMEOUT.") from exc
-        if returncode:
-            details = stderr.strip() or stdout.strip() or "Worker produced no error details."
-            raise RuntimeError(f"GLBFaceRetexture CPU worker failed (exit {returncode}):\n{details}")
-        for output in (output_path, comparison_path, proof_path, mask_path):
-            if not output.is_file() or output.stat().st_size == 0:
-                raise RuntimeError(f"GLBFaceRetexture worker did not produce its required output: {output}")
-        proof = json.loads(proof_path.read_text(encoding="utf-8"))
-        with Image.open(comparison_path) as comparison_image:
-            comparison = np.asarray(comparison_image.convert("RGB"), dtype=np.float32) / 255.0
-        comparison_tensor = torch.from_numpy(comparison).unsqueeze(0)
-        with Image.open(mask_path) as mask_image:
-            mask = np.asarray(mask_image.convert("RGB"), dtype=np.float32) / 255.0
-        mask_tensor = torch.from_numpy(mask).unsqueeze(0)
-        proof_text = json.dumps(proof, ensure_ascii=False, indent=2)
+        _run(command, python, repair, work_dir, (output_path, comparison_path, proof_path, mask_path))
+        proof_text = json.dumps(json.loads(proof_path.read_text(encoding="utf-8")), ensure_ascii=False, indent=2)
         return {"ui": {"text": [proof_text]},
-                "result": (Types.File3D(str(output_path)), comparison_tensor, proof_text, mask_tensor)}
+                "result": (Types.File3D(str(output_path)), _image(comparison_path), proof_text, _image(mask_path))}
 
 
-NODE_CLASS_MAPPINGS = {"GLBFaceRetexture": GLBFaceRetexture}
-NODE_DISPLAY_NAME_MAPPINGS = {"GLBFaceRetexture": "GLB Face Retexture (Preserve Geometry)"}
+def _prepare():
+    """Private worker, models and a fresh work directory under ComfyUI's temp folder."""
+    repair = installer_command(PACKAGE_DIR)
+    python = str(worker_python(PACKAGE_DIR))
+    model_dir = PACKAGE_DIR / "models"
+    for filename, _, _ in MODELS:
+        if not (model_dir / filename).is_file():
+            raise RuntimeError(f"GLBFaceRetexture is missing {model_dir / filename}. Run: {repair}")
+    folder_paths_temp = Path(folder_paths.get_temp_directory())
+    folder_paths_temp.mkdir(parents=True, exist_ok=True)
+    return python, repair, model_dir, Path(tempfile.mkdtemp(prefix="glb_face_retexture_", dir=folder_paths_temp))
+
+
+def _source_path(source_glb, work_dir):
+    if not isinstance(source_glb, Types.File3D) or source_glb.format != "glb":
+        raise ValueError("GLBFaceRetexture requires a static textured GLB from the native Load 3D node.")
+    if work_dir is None:
+        return None
+    source = source_glb.get_source()
+    if isinstance(source, str):
+        source_path = Path(source).resolve()
+    else:
+        source_path = work_dir / "source.glb"
+        source_glb.save_to(str(source_path))
+    if not source_path.is_file():
+        raise ValueError(f"GLBFaceRetexture source GLB does not exist: {source_path}")
+    return source_path
+
+
+def _run(command, python, repair, work_dir, outputs):
+    timeout = worker_timeout()
+    try:
+        # Cancelling the prompt in ComfyUI raises here and kills the worker.
+        returncode, stdout, stderr = run_worker(
+            command, cwd=PACKAGE_DIR, env=worker_environment(), log_dir=work_dir, timeout=timeout,
+            check=comfy.model_management.throw_exception_if_processing_interrupted,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"GLBFaceRetexture could not start the CPU worker ({python}): {exc}. Run: {repair}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"GLBFaceRetexture CPU worker exceeded {timeout:g} s and was stopped. "
+                           "Lower render_resolution or raise GLB_FACE_RETEXTURE_TIMEOUT.") from exc
+    if returncode:
+        details = stderr.strip() or stdout.strip() or "Worker produced no error details."
+        raise RuntimeError(f"GLBFaceRetexture CPU worker failed (exit {returncode}):\n{details}")
+    for output in outputs:
+        if not output.is_file() or output.stat().st_size == 0:
+            raise RuntimeError(f"GLBFaceRetexture worker did not produce its required output: {output}")
+
+
+def _image(path):
+    with Image.open(path) as image:
+        pixels = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    return torch.from_numpy(pixels).unsqueeze(0)
+
+
+class GLBFaceRegions:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "source_glb": ("FILE_3D", {"tooltip": "Original static textured GLB (single primitive, unrigged)."}),
+                "render_resolution": ("INT", {"default": 768, "min": 256, "max": 2048, "step": 64}),
+                "yaw": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 1.0, "tooltip": "Source viewing yaw in degrees for face detection."}),
+            },
+            "optional": {
+                "depth_window": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "How far behind the visible surface (in eye spans) hidden vertices still belong to the region in front of them, e.g. eye sockets and the inside of the mouth."}),
+            }
+        }
+
+    RETURN_TYPES = ("FILE_3D", "IMAGE", "STRING")
+    RETURN_NAMES = ("labelled_glb", "preview", "proof_metrics")
+    OUTPUT_TOOLTIPS = ("The source GLB unchanged, plus per-vertex _FACE_REGION and _FACE_DEPTH attributes and extras.glb_face_regions.",
+                       "Head render with the regions tinted; labelled vertices hidden behind the surface are drawn as white squares.",
+                       "Region counts, landmarks in model coordinates and observations (JSON).")
+    FUNCTION = "locate"
+    CATEGORY = "3d/texture"
+    DESCRIPTION = "Label eyes with lid rim, brows, lips and nose on every vertex from MediaPipe landmarks of a head render. Geometry, UVs, images and vertex order stay byte-identical; no photo needed. CPU worker runs in a separate process."
+
+    def locate(self, source_glb, render_resolution, yaw, depth_window=0.3):
+        _source_path(source_glb, None)
+        python, repair, model_dir, work_dir = _prepare()
+        source_path = _source_path(source_glb, work_dir)
+        output_path = work_dir / "GLBFaceRegions.glb"
+        preview_path = work_dir / "regions.png"
+        proof_path = work_dir / "proof.json"
+        command = [
+            python, "-E", "-s", "-X", "utf8", str(PACKAGE_DIR / "worker.py"), "--locate",
+            "--source-glb", str(source_path), "--output-glb", str(output_path),
+            "--preview-png", str(preview_path), "--proof-json", str(proof_path), "--model-dir", str(model_dir),
+            "--render-resolution", str(render_resolution), "--yaw", str(yaw), "--depth-window", str(depth_window),
+        ]
+        _run(command, python, repair, work_dir, (output_path, preview_path, proof_path))
+        proof_text = json.dumps(json.loads(proof_path.read_text(encoding="utf-8")), ensure_ascii=False, indent=2)
+        return {"ui": {"text": [proof_text]},
+                "result": (Types.File3D(str(output_path)), _image(preview_path), proof_text)}
+
+
+NODE_CLASS_MAPPINGS = {"GLBFaceRetexture": GLBFaceRetexture, "GLBFaceRegions": GLBFaceRegions}
+NODE_DISPLAY_NAME_MAPPINGS = {"GLBFaceRetexture": "GLB Face Retexture (Preserve Geometry)",
+                              "GLBFaceRegions": "GLB Face Regions (Locate Only)"}

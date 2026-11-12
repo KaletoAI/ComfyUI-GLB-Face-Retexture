@@ -158,6 +158,41 @@ class VisionInputTests(unittest.TestCase):
             self.assertTrue(((mask > 0) & (mask < 255)).any())
 
 
+    def test_locate_labels_face_regions_without_changing_the_mesh(self):
+        """Locate only: every region is found, the original GLB stays an exact prefix, output is deterministic."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.glb"
+            textured_grid(source, PORTRAIT.read_bytes(), cells=96)
+            original = source.read_bytes()
+            first = [root / "a.glb", root / "a.png", root / "a.json"]
+            second = [root / "b.glb", root / "b.png", root / "b.json"]
+            report = core.run_locate(source, *first, MODEL_DIR, render_resolution=512)
+            core.run_locate(source, *second, MODEL_DIR, render_resolution=512)
+            self.assertEqual([path.read_bytes() for path in first], [path.read_bytes() for path in second])
+            self.assertEqual(source.read_bytes(), original)
+            self.assertEqual(report["status"], "face_regions_only")
+            for name, region in report["regions"].items():
+                self.assertGreater(region["vertices"], 0, name)
+                # A flat grid has nothing behind its surface.
+                self.assertEqual(region["hidden_vertices"], 0, name)
+            source_data = core.read_source(source)
+            doc, binary = core.parse_glb(first[0].read_bytes())
+            self.assertEqual(binary[:len(source_data["binary"])], source_data["binary"])
+            attributes = doc["meshes"][0]["primitives"][0]["attributes"]
+            labels = core.accessor_array(doc, binary, attributes["_FACE_REGION"])
+            self.assertEqual(len(labels), len(source_data["positions"]))
+            self.assertEqual(int((labels > 0).sum()), report["labelled_vertices"])
+            extras = doc["extras"]["glb_face_regions"]
+            self.assertEqual(extras["regions"]["right_eye"], 1)
+            points = {int(k): v for k, v in extras["landmarks_model"].items()}
+            # Subject's right eye (landmark 33) appears on the image left, i.e. at smaller x.
+            self.assertLess(points[33][0], points[263][0])
+            self.assertGreater(points[33][1], points[152][1])
+            with Image.open(first[1]) as preview:
+                self.assertEqual(preview.size, (512, 512))
+
+
 def cyan_canvas(size=160):
     """The fixture portrait as saturated cyan skin, small on a light 768 px canvas."""
     with Image.open(PORTRAIT) as image:
