@@ -35,6 +35,8 @@ def argument_parser():
     parser.add_argument("--skin-recolor", type=float, default=0.0)
     parser.add_argument("--seam-blend", choices=("true", "false"), default="true")
     parser.add_argument("--projection-mask-png", type=Path)
+    parser.add_argument("--cover-folds", choices=("true", "false"), default="true")
+    parser.add_argument("--coverage-mask-png", type=Path)
     return parser
 
 
@@ -82,6 +84,8 @@ def main():
             skin_recolor=arguments.skin_recolor,
             seam_blend=arguments.seam_blend == "true",
             projection_mask_png=arguments.projection_mask_png,
+            cover_folds=arguments.cover_folds == "true",
+            coverage_mask_png=arguments.coverage_mask_png,
         )
     except ImportError as exc:
         print(f"GLBFaceRetexture CPU dependency unavailable in {sys.executable}: {exc}.\nRun: {repair}", file=sys.stderr)

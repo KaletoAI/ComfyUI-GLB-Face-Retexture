@@ -125,9 +125,13 @@ class BridgeTests(unittest.TestCase):
             Path(arguments["--proof-json"]).write_text(json.dumps({"status": "face_texture_only"}), encoding="utf-8")
             self.assertEqual(arguments["--seam-blend"], "true")
             Image.fromarray(np.array([[0, 128, 255]], dtype=np.uint8)).save(arguments["--projection-mask-png"])
+            self.assertEqual(arguments["--cover-folds"], "true")
+            Image.fromarray(np.array([[255, 0, 128, 128]], dtype=np.uint8)).save(arguments["--coverage-mask-png"])
             return 0, "", ""
         result = self.run_node(worker)
-        glb, comparison, proof, mask = result["result"]
+        glb, comparison, proof, mask, coverage = result["result"]
+        self.assertEqual(coverage.shape, (1, 1, 4, 3))
+        np.testing.assert_allclose(coverage.array[0, 0, :, 0], [1, 0, 128/255, 128/255], rtol=1e-6)
         self.assertEqual(mask.shape, (1, 1, 3, 3))
         np.testing.assert_allclose(mask.array[0, 0, :, 0], [0, 128/255, 1], rtol=1e-6)
         np.testing.assert_array_equal(mask.array[..., 0], mask.array[..., 2])
@@ -138,9 +142,10 @@ class BridgeTests(unittest.TestCase):
 
     def test_optional_controls_forwarded_and_workflow_order(self):
         schema = self.bridge.GLBFaceRetexture.INPUT_TYPES()
-        controls = dict(light_balance=.5, tone_match=.75, brightness=.9, skin_recolor=.6, seam_blend=False)
+        controls = dict(light_balance=.5, tone_match=.75, brightness=.9, skin_recolor=.6, seam_blend=False, cover_folds=False)
         self.assertEqual(list(schema["optional"]), list(controls))
         self.assertIs(schema["optional"]["seam_blend"][1]["default"], True)
+        self.assertIs(schema["optional"]["cover_folds"][1]["default"], True)
         def worker(command, **kwargs):
             arguments = worker_arguments(command)
             for name, value in controls.items():
@@ -237,6 +242,7 @@ class BridgeTests(unittest.TestCase):
         Image.new("RGB", (6, 4)).save(arguments["--comparison-png"])
         Path(arguments["--proof-json"]).write_text("{}", encoding="utf-8")
         Image.new("L", (3, 1)).save(arguments["--projection-mask-png"])
+        Image.new("L", (3, 1)).save(arguments["--coverage-mask-png"])
         (kwargs["log_dir"] / "worker.stderr.log").write_text("log", encoding="utf-8")
         return 0, "", ""
 

@@ -278,6 +278,15 @@
           },
           "link": null,
           "shape": 7
+        },
+        {
+          "name": "cover_folds",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "cover_folds"
+          },
+          "link": null,
+          "shape": 7
         }
       ],
       "outputs": [
@@ -305,6 +314,11 @@
           "name": "projection_mask",
           "type": "IMAGE",
           "links": null
+        },
+        {
+          "name": "coverage_mask",
+          "type": "IMAGE",
+          "links": null
         }
       ],
       "properties": {
@@ -321,6 +335,7 @@
         0,
         1,
         0,
+        true,
         true
       ],
       "widgets_values_named": {
@@ -332,7 +347,8 @@
         "tone_match": 0,
         "brightness": 1,
         "skin_recolor": 0,
-        "seam_blend": true
+        "seam_blend": true,
+        "cover_folds": true
       },
       "color": "#233",
       "bgcolor": "#344"

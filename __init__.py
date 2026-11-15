@@ -57,20 +57,23 @@ class GLBFaceRetexture:
                 "brightness": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 1.5, "step": 0.05, "tooltip": "Final brightness scale of the photo face before projection. 1 = unchanged."}),
                 "skin_recolor": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Recolours the mesh's own skin (face, neck, arms, hands — every skin-coloured texel of the original texture) toward the photo's skin tone, for meshes whose generator shifted the skin colour. Clothes and hair are left alone. 0 = off."}),
                 "seam_blend": ("BOOLEAN", {"default": True, "tooltip": "Blends the colour of the projected face into the surrounding mesh skin along the projection edge (low frequencies only, in a narrow band; eyes, brows and lips untouched). Off = the colour transition of 1.4.x, byte-identical, for comparison."}),
+                "cover_folds": ("BOOLEAN", {"default": True, "tooltip": "Also paints eye and brow texels the straight front view misses: mesh paint the segmenter takes for hair (a dark painted brow block, lash flaps) and fold undersides up to a few millimetres behind the visible surface, seen from slightly below. Off = the face texture of 1.7.x."}),
             }
         }
 
-    RETURN_TYPES = ("FILE_3D", "IMAGE", "STRING", "IMAGE")
-    RETURN_NAMES = ("corrected_glb", "comparison", "proof_metrics", "projection_mask")
+    RETURN_TYPES = ("FILE_3D", "IMAGE", "STRING", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("corrected_glb", "comparison", "proof_metrics", "projection_mask", "coverage_mask")
     OUTPUT_TOOLTIPS = ("GLB with the original geometry and a private face texture.",
                        "Reference photo, original mesh albedo and the result, side by side.",
                        "Preservation and measurement report (JSON).",
-                       "Per-texel blend amount of the face atlas in texture space: white = projected photo, black = original texel, grey = blend.")
+                       "Per-texel blend amount of the face atlas in texture space: white = projected photo, black = original texel, grey = blend.",
+                       "Coverage of the face atlas in texture space: white (255) = written by the projection, black (0) = inside the face area but not written, grey (128) = outside the face area. The GLB carries the same mask in extras.glb_face_retexture.")
     FUNCTION = "retexture"
     CATEGORY = "3d/texture"
     DESCRIPTION = "Project a matching photo onto only the visible face texture; preserve the source GLB geometry and original assets. CPU worker runs in a separate process."
 
-    def retexture(self, source_glb, reference_image, strength, feather, render_resolution, yaw, light_balance=0.0, tone_match=0.0, brightness=1.0, skin_recolor=0.0, seam_blend=True):
+    def retexture(self, source_glb, reference_image, strength, feather, render_resolution, yaw, light_balance=0.0, tone_match=0.0, brightness=1.0, skin_recolor=0.0, seam_blend=True,
+                  cover_folds=True):
         _source_path(source_glb, None)
         if reference_image.ndim != 4 or reference_image.shape[0] != 1 or reference_image.shape[-1] != 3:
             raise ValueError("GLBFaceRetexture requires exactly one RGB reference image, not an image batch.")
@@ -78,10 +81,10 @@ class GLBFaceRetexture:
         with _workspace(work_dir) as keep:
             return self._retexture(python, repair, model_dir, work_dir, keep, source_glb, reference_image, strength,
                                    feather, render_resolution, yaw, light_balance, tone_match, brightness,
-                                   skin_recolor, seam_blend)
+                                   skin_recolor, seam_blend, cover_folds)
 
     def _retexture(self, python, repair, model_dir, work_dir, keep, source_glb, reference_image, strength, feather,
-                   render_resolution, yaw, light_balance, tone_match, brightness, skin_recolor, seam_blend):
+                   render_resolution, yaw, light_balance, tone_match, brightness, skin_recolor, seam_blend, cover_folds):
         source_path = _source_path(source_glb, work_dir)
 
         reference_path = work_dir / "reference.png"
@@ -91,6 +94,7 @@ class GLBFaceRetexture:
         comparison_path = work_dir / "comparison.png"
         proof_path = work_dir / "proof.json"
         mask_path = work_dir / "projection_mask.png"
+        coverage_path = work_dir / "coverage_mask.png"
         command = [
             python, "-E", "-s", "-X", "utf8", str(PACKAGE_DIR / "worker.py"),
             "--source-glb", str(source_path), "--reference-image", str(reference_path),
@@ -101,12 +105,14 @@ class GLBFaceRetexture:
             f"--light-balance={light_balance}", f"--tone-match={tone_match}", f"--brightness={brightness}",
             f"--skin-recolor={skin_recolor}",
             "--seam-blend", "true" if seam_blend else "false", "--projection-mask-png", str(mask_path),
+            "--cover-folds", "true" if cover_folds else "false", "--coverage-mask-png", str(coverage_path),
         ]
-        _run(command, python, repair, work_dir, (output_path, comparison_path, proof_path, mask_path))
+        _run(command, python, repair, work_dir, (output_path, comparison_path, proof_path, mask_path, coverage_path))
         proof_text = json.dumps(json.loads(proof_path.read_text(encoding="utf-8")), ensure_ascii=False, indent=2)
         keep.append(output_path)
         return {"ui": {"text": [proof_text]},
-                "result": (Types.File3D(str(output_path)), _image(comparison_path), proof_text, _image(mask_path))}
+                "result": (Types.File3D(str(output_path)), _image(comparison_path), proof_text, _image(mask_path),
+                           _image(coverage_path))}
 
 
 def _prepare():
