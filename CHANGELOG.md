@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.8.0 — 2026-11-16
+
+Brows and lids that the front view misses, and a coverage mask for downstream tools.
+
+- **`cover_folds`** (new optional input, default on). On a generated character, the mesh's own thick black brow stayed next to the photo's thin brow and read as a torn brow. Two causes, both measured on that mesh. First, the selfie segmenter read the painted brow block as hair, so the projection skipped triangles that are fully visible from the front. A veto blob that touches the source's eye and brow landmark hulls and stays within 0.25 eye spans of them now counts as mesh paint; a fringe reaches the hairline and keeps its veto. Second, the brow is modelled as a small fold over the upper lid. Within 0.15 eye spans of the eye and brow hulls, texels up to 0.05 eye spans behind the visible surface now take the photo at their own screen position, whatever their triangle's facing; visible texels always win. Unwritten texels darker than 0.6 of the skin brightness in the eye and brow band went from 813 to 9. On seven further characters dark lash and brow shards above the lids disappeared; none got worse.
+- **Coverage mask.** The GLB carries the face atlas's coverage as an embedded greyscale PNG that no texture uses (255 written, 0 face area not written, 128 outside), referenced from the new root `extras.glb_face_retexture` together with the node `version`. Fifth node output `coverage_mask`, worker option `--coverage-mask-png`, proof blocks `coverage_mask` and `cover_folds`, and `node_version` in the proof.
+- `cover_folds` off gives the 1.7.0 face texture, body atlas and comparison byte for byte (portrait grid, cyan case, two Vallerie meshes, the 1.6.1 job mesh); the GLB only gains the coverage image and the extras record.
+- 11 new tests: fold cover (window, band, facing, visible priority), released veto (painted brow vs fringe), coverage values, GLB record, version.
+
 ## 1.7.0 — 2026-11-15
 
 Fixes from a review of the whole code base. Every input that succeeded with 1.6.1 gives byte-identical GLB, comparison and proof (portrait grid and cyan luminance case compared).

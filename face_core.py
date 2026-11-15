@@ -21,8 +21,19 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 from scipy.ndimage import distance_transform_edt, map_coordinates, gaussian_filter, zoom
 
+VERSION = '1.8.0'
 MAX_TEXTURE_SIDE = 8192
 MAX_TEXTURE_PIXELS = 8192 * 8192
+# Fold cover, in eye spans of the render: the band around the source's own eye
+# and brow hulls, and how far behind the visible surface a texel may lie and
+# still take the photo (a brow fold's underside, the lid band under it).
+COVER_BAND, COVER_DEPTH = .15, .05
+# A non-skin blob of the source render that touches the eyes or brows and stays
+# within this many eye spans of them is mesh paint (a painted brow block, a lash
+# flap), not hair: it does not veto the projection. A fringe reaches farther.
+VETO_REACH = .25
+# Coverage mask bytes: written by the projection, face area not written, elsewhere.
+COVER_WRITTEN, COVER_MISSED, COVER_OUTSIDE = 255, 0, 128
 
 FACE_OVAL = (10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288,
              397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136,
@@ -592,7 +603,49 @@ def semantic_skin(segmenter, mp, pixels):
     return skin.astype(np.float32).clip(0, 1), hair.astype(np.float32).clip(0, 1)
 
 
-def semantic_face_mask(segmenter, mp, rgb, landmarks, box, feather):
+def feature_band_distance(landmarks, shape):
+    """Distance (eye spans) of every pixel to the eye+brow hulls of these landmarks."""
+    height, width = shape[:2]
+    points = landmarks[:, :2]*[width, height]
+    span = float(np.linalg.norm(points[263]-points[33]))
+    features = Image.new('L', (width, height))
+    draw = ImageDraw.Draw(features)
+    for key in ('left_eye_brow', 'right_eye_brow'):
+        draw.polygon(_hull(points[list(FEATURES[key])]), fill=255)
+    return distance_transform_edt(np.asarray(features) == 0)/max(span, 1e-9), span
+
+
+def release_feature_veto(semantic, landmarks):
+    """Pixels whose semantic veto is mesh paint on the eyes or brows, not hair.
+
+    The segmenter reads a mesh's dark painted brow block or lash flap as hair,
+    so the projection would skip it and leave it next to the photo's brow. A
+    veto blob (semantic < .5) that touches the eye+brow hulls (within .05 eye
+    spans) and stays within VETO_REACH eye spans of them is released (dilated
+    by two pixels); hair over the brows reaches the hairline and keeps its veto.
+    """
+    from scipy.ndimage import binary_dilation, label
+    distance, _ = feature_band_distance(landmarks, semantic.shape)
+    veto = semantic < .5
+    labels, count = label(veto)
+    reach = np.zeros(count+1)
+    np.maximum.at(reach, labels.ravel(), distance.ravel())
+    touching = np.zeros(count+1, dtype=bool)
+    touching[np.unique(labels[veto & (distance < .05)])] = True
+    touching[0] = False
+    isolated = touching & (reach < VETO_REACH)
+    if not isolated.any():
+        return np.zeros(semantic.shape, dtype=np.float32), 0
+    return binary_dilation(isolated[labels], iterations=2).astype(np.float32), int(isolated.sum())
+
+
+def semantic_face_mask(segmenter, mp, rgb, landmarks, box, feather, release_features=False):
+    """Projection weight of every pixel: face oval x skin, not hair.
+
+    `release_features` (the source render only) lifts the veto of mesh paint on
+    the eyes and brows (`release_feature_veto`); the returned semantics stay the
+    segmenter's, since that paint is not skin.
+    """
     height, width = rgb.shape[:2]
     skin, hair = semantic_skin(segmenter, mp, rgb)
     skin, hair = _resize(skin, width, height, True), _resize(hair, width, height, True)
@@ -610,11 +663,20 @@ def semantic_face_mask(segmenter, mp, rgb, landmarks, box, feather):
     border = max(1, feather*span)
     oval_weight = np.clip(distance_transform_edt(inside)/border, 0, 1)
     semantic = np.clip((skin-.35)/.4, 0, 1) * np.clip((.35-hair)/.25, 0, 1)
-    mask = (oval_weight*semantic).astype(np.float32)
+    released = None
+    if release_features:
+        released, blobs = release_feature_veto(semantic, landmarks)
+        mask = (oval_weight*np.maximum(semantic, released)).astype(np.float32)
+    else:
+        mask = (oval_weight*semantic).astype(np.float32)
     if (mask > .25).sum() < 16:
         raise FaceTextureError('Face semantics contain no usable skin region')
-    return mask, semantic.astype(np.float32), {'skin_classes': [2, 3], 'hair_class': 1, 'face_oval_landmarks': list(FACE_OVAL),
-                  'usable_face_pixels': int((mask > .25).sum()), 'feather_eye_fraction': float(feather)}
+    report = {'skin_classes': [2, 3], 'hair_class': 1, 'face_oval_landmarks': list(FACE_OVAL),
+              'usable_face_pixels': int((mask > .25).sum()), 'feather_eye_fraction': float(feather)}
+    if released is not None:
+        report['released_feature_veto'] = {'blobs': blobs, 'pixels': int(((released > 0) & (semantic < .5)).sum()),
+                                           'reach_eye_fraction': VETO_REACH}
+    return mask, semantic.astype(np.float32), report
 
 
 def recolor_skin(source, full_render, skin, hair, source_rgb, source_mask,
@@ -847,6 +909,58 @@ def select_triangles(source, rendered, source_mask, photo_mask, affine):
     return selected
 
 
+def cover_triangles(source, rendered, source_mask, band, window):
+    """Triangles of the eye/brow band whose centroid lies at most `window` behind the visible surface.
+
+    Their facing does not matter: a brow fold's underside, a back-wound flap and
+    the lid band under the fold are seen from slightly below, not from the front.
+    """
+    view, owners = rendered['view'], rendered['owners']
+    triangles = source['triangles']
+    centre = np.floor(view['xy'][triangles].mean(axis=1)).astype(np.int64)
+    depth = view['depth'][triangles].mean(axis=1)
+    height, width = owners.shape
+    rows = np.flatnonzero((centre >= 0).all(axis=1) & (centre[:, 0] < width) & (centre[:, 1] < height))
+    px, py = centre[rows, 0], centre[rows, 1]
+    result = np.zeros(len(triangles), dtype=bool)
+    result[rows] = (band[py, px] & (source_mask[py, px] > .05) & (owners[py, px] >= 0)
+                    & (rendered['depth'][py, px]-depth[rows] <= window))
+    return result
+
+
+def coverage_mask(source, rendered, landmarks, painted, window):
+    """Per-texel coverage byte of the face atlas (see COVER_*).
+
+    The face area holds every texel, of any triangle, whose surface point lies
+    inside the source's face-oval landmarks and at most `window` behind the
+    visible surface; `painted` > 0 marks the texels the projection wrote.
+    """
+    view, owners, depth = rendered['view'], rendered['owners'], rendered['depth']
+    height, width = owners.shape
+    oval = Image.new('L', (width, height))
+    ImageDraw.Draw(oval).polygon([tuple(p) for p in landmarks[list(FACE_OVAL), :2]*[width, height]], fill=255)
+    oval = np.asarray(oval) > 0
+    rows, cols = np.nonzero(oval)
+    triangles = source['triangles']
+    xy = view['xy'][triangles]
+    near = np.flatnonzero((xy[..., 0].max(axis=1) >= cols.min()) & (xy[..., 0].min(axis=1) <= cols.max()+1)
+                          & (xy[..., 1].max(axis=1) >= rows.min()) & (xy[..., 1].min(axis=1) <= rows.max()+1))
+    tex_height, tex_width = painted.shape
+    result = np.full((tex_height, tex_width), COVER_OUTSIDE, dtype=np.uint8)
+    tex = source['uv'][triangles[near]]*[tex_width, tex_height]-.5
+    for local, points, bary in _raster_batch(tex, tex_width, tex_height, 0):
+        face = near[local]
+        screen = _interpolate(bary, view['xy'][triangles[face]])
+        z = _interpolate(bary, view['depth'][triangles[face]])
+        px, py = np.floor(screen[:, 0]).astype(int), np.floor(screen[:, 1]).astype(int)
+        frame = (px >= 0) & (py >= 0) & (px < width) & (py < height)
+        points, z, px, py = points[frame], z[frame], px[frame], py[frame]
+        area = oval[py, px] & (owners[py, px] >= 0) & (depth[py, px]-z <= window)
+        result[points[area, 1], points[area, 0]] = COVER_MISSED
+    result[painted > 0] = COVER_WRITTEN
+    return result
+
+
 def _hull(points):
     """Convex hull (monotone chain), counter-clockwise, without repeated end point."""
     points = sorted(map(tuple, np.asarray(points, dtype=float)))
@@ -1002,11 +1116,16 @@ def seam_field(surface_rgb, owners, source_mask, source_skin, photo, photo_mask,
     return field, report
 
 
-def paint_atlas(source, selected, rendered, source_mask, photo, photo_mask, affine, strength, seam=None, with_mask=False):
+def paint_atlas(source, selected, rendered, source_mask, photo, photo_mask, affine, strength, seam=None, with_mask=False,
+                cover=None):
     """Blend the registered photo into a copy of the atlas.
 
     `seam` is an optional render-space log gain from `seam_field`; `with_mask`
-    also returns the per-texel blend amount (0 = original texel).
+    also returns the per-texel blend amount (0 = original texel). `cover`
+    ({'band': render-space bool, 'window': model units}) also paints texels the
+    front view does not see, inside the band and at most `window` behind the
+    visible surface, with the photo at their own screen position; a texel the
+    front view sees always wins over a hidden one.
     """
     atlas = source['atlas'].copy()
     original = source['atlas']
@@ -1046,15 +1165,22 @@ def paint_atlas(source, selected, rendered, source_mask, photo, photo_mask, affi
         visible = (owner == face) | ((owner >= 0) & (np.abs(z-sample_depth) <= local_tolerance))
         photo_xy = np.c_[screen, np.ones(len(screen))] @ affine
         amount = _sample(source_mask, screen) * _sample(photo_mask, photo_xy) * strength
-        keep = visible & (amount > 1e-5)
+        if cover is None:
+            score = amount
+            keep = visible & (amount > 1e-5)
+        else:
+            hidden = ~visible & (owner >= 0) & cover['band'][py, px] & (sample_depth-z <= cover['window'])
+            score = amount + 2*visible
+            keep = (visible | hidden) & (amount > 1e-5)
         keys = points[keep, 1]*width + points[keep, 0]
-        best = _winners(keys, amount[keep], face[keep])
-        parts.append((keys[best], amount[keep][best], face[keep][best], photo_xy[keep][best], screen[keep][best]))
+        best = _winners(keys, score[keep], face[keep])
+        parts.append((keys[best], amount[keep][best], face[keep][best], photo_xy[keep][best], screen[keep][best],
+                      score[keep][best]))
     if not parts:
         raise FaceTextureError('Face projection covers no visible source atlas texels')
-    keys, amount, face, photo_xy, screen = (np.concatenate(column) for column in zip(*parts))
-    best = _winners(keys, amount, face)
-    keys, amount, photo_xy, screen = keys[best], amount[best], photo_xy[best], screen[best]
+    keys, amount, face, photo_xy, screen, score = (np.concatenate(column) for column in zip(*parts))
+    best = _winners(keys, score, face)
+    keys, amount, photo_xy, screen, score = keys[best], amount[best], photo_xy[best], screen[best], score[best]
     if not len(keys):
         raise FaceTextureError('Face projection covers no visible source atlas texels')
     py, px = np.divmod(keys, width)
@@ -1094,6 +1220,8 @@ def paint_atlas(source, selected, rendered, source_mask, photo, photo_mask, affi
                                'factor_clipped_texture_pixels': int(clipped.sum()),
                                'atlas_size': [width, height],
                                'scalar_base_color_factor': source['factor'].tolist()}
+    if cover is not None:
+        report['hidden_texture_pixels_painted'] = int((score < 2).sum())
     if not with_mask:
         return output.getvalue(), report
     mask = np.zeros((height, width), dtype=np.float32)
@@ -1193,7 +1321,12 @@ def seam_delta_e(source, selected, body_atlas, face_atlas, mask, radius=3, exclu
     return report
 
 
-def partition_glb(source, selected, atlas_png, body_atlas_png=None):
+def partition_glb(source, selected, atlas_png, body_atlas_png=None, coverage_png=None, meta=None):
+    """Append the face material (and an optional recoloured body atlas) without touching original bytes.
+
+    `coverage_png` is appended as an image no texture uses; `meta` goes to the
+    root `extras.glb_face_retexture`, with `coverage_mask.image` set to it.
+    """
     selected = np.asarray(selected, dtype=bool)
     if selected.shape != (len(source['triangles']),) or not selected.any() or selected.all():
         raise FaceTextureError('Expected a nonempty proper face triangle partition')
@@ -1245,6 +1378,16 @@ def partition_glb(source, selected, atlas_png, body_atlas_png=None):
         material['pbrMetallicRoughness']['baseColorTexture']['index'] = texture_index
         body['material'] = len(doc['materials'])
         doc['materials'].append(material)
+    if meta is not None:
+        meta = copy.deepcopy(meta)
+        if coverage_png is not None:
+            meta.setdefault('coverage_mask', {})['image'] = len(doc['images'])
+            doc['images'].append({'name': 'Face projection coverage', 'mimeType': 'image/png',
+                                  'bufferView': blob(coverage_png)})
+        extras = doc.get('extras', {})
+        if not isinstance(extras, dict):
+            raise FaceTextureError('Root glTF extras must be an object to carry the face retexture record')
+        doc['extras'] = {**extras, 'glb_face_retexture': meta}
     doc['meshes'][0]['primitives'] = [body, face]
     doc['buffers'][0]['byteLength'] = len(binary)
     encoded = json.dumps(doc, separators=(',', ':'), allow_nan=False).encode()
@@ -1451,14 +1594,20 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
                   strength: float = 1.0, feather: float = .18,
                   render_resolution: int = 768, yaw: float = 0.0,
                   light_balance: float = 0.0, tone_match: float = 0.0, brightness: float = 1.0, skin_recolor: float = 0.0,
-                  seam_blend: bool = True, projection_mask_png: Path | None = None) -> dict:
+                  seam_blend: bool = True, projection_mask_png: Path | None = None,
+                  cover_folds: bool = True, coverage_mask_png: Path | None = None) -> dict:
     """Observe, register, paint and append a private face texture; never deform.
 
     `projection_mask_png`, if given, receives the per-texel blend amount of the
     face atlas as 8-bit greyscale (255 = projected, 0 = original texel).
+    `cover_folds` lifts the segmenter's veto from mesh paint on the eyes and
+    brows and paints hidden texels near the surface there (fold undersides).
+    The output GLB carries the coverage mask (COVER_*) as an unused image and
+    the node version in `extras.glb_face_retexture`; `coverage_mask_png`, if
+    given, receives the same mask.
     """
-    if not isinstance(seam_blend, bool):
-        raise FaceTextureError('seam_blend must be true or false')
+    if not isinstance(seam_blend, bool) or not isinstance(cover_folds, bool):
+        raise FaceTextureError('seam_blend and cover_folds must be true or false')
     _validate_photo_controls(light_balance, tone_match, brightness)
     if not np.isfinite(skin_recolor) or not 0 <= skin_recolor <= 1:
         raise FaceTextureError('skin_recolor must be finite and in [0,1]')
@@ -1472,6 +1621,9 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
     if projection_mask_png is not None:
         projection_mask_png = Path(projection_mask_png)
         outputs.append(projection_mask_png)
+    if coverage_mask_png is not None:
+        coverage_mask_png = Path(coverage_mask_png)
+        outputs.append(coverage_mask_png)
     targets = [p.resolve() for p in outputs]
     if len(set(targets)) != len(targets) or any(p in (source_glb.resolve(), reference_image.resolve()) for p in targets):
         raise FaceTextureError('Output paths must be distinct and must not overwrite inputs')
@@ -1481,6 +1633,8 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
         if not model.is_file():
             raise FaceTextureError('Missing local CPU model: '+str(model)+'; run python install.py')
     source = read_source(source_glb)
+    if not isinstance(source['gltf'].get('extras', {}), dict):
+        raise FaceTextureError('Root glTF extras must be an object to carry the face retexture record')
     photo = read_photo(reference_image)
     reference_rgb_hash = hashlib.sha256(np.asarray(photo.shape, dtype='<u4').tobytes() + photo.tobytes()).hexdigest()
     import mediapipe as mp
@@ -1496,7 +1650,8 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
     segment_options = vision.ImageSegmenterOptions(base_options=base(segment_model), running_mode=vision.RunningMode.IMAGE,
                                                    output_confidence_masks=True, output_category_mask=False)
     with vision.ImageSegmenter.create_from_options(segment_options) as segmenter:
-        source_mask, source_skin, source_semantics = semantic_face_mask(segmenter, mp, before['rgb'], source_lm, source_box, feather)
+        source_mask, source_skin, source_semantics = semantic_face_mask(segmenter, mp, before['rgb'], source_lm, source_box, feather,
+                                                                        release_features=cover_folds)
         photo_mask, _, photo_semantics = semantic_face_mask(segmenter, mp, photo, photo_lm, photo_box, feather)
         if skin_recolor:
             full_skin, full_hair = semantic_skin(segmenter, mp, full_render['rgb'])
@@ -1518,20 +1673,42 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
         before['rgb'], source_mask, source_skin_gain=skin_report.get('gain_rgb'))
     affine, registration = register_faces(source_lm, photo_lm, before['rgb'].shape, photo.shape)
     selected = select_triangles(source, before, source_mask, photo_mask, affine)
+    band_distance, render_span = feature_band_distance(source_lm, before['rgb'].shape)
+    window = COVER_DEPTH*render_span*(view['bounds'][2]-view['bounds'][0])/render_resolution
+    cover, cover_report = None, {'enabled': False}
+    if cover_folds:
+        cover = {'band': band_distance < COVER_BAND, 'window': window}
+        folds = cover_triangles(source, before, source_mask, cover['band'], window) & ~selected
+        selected = selected | folds
+        cover_report = {'enabled': True, 'band_eye_fraction': COVER_BAND, 'depth_eye_fraction': COVER_DEPTH,
+                        'fold_triangles_added': int(folds.sum())}
     seam, seam_report = None, {'enabled': False}
     if seam_blend:
         seam, seam_report = seam_field(expected_body['rgb'], before['owners'], source_mask, source_skin,
                                        photo, photo_mask, photo_lm, affine, feather)
         seam_report = {'enabled': True, **seam_report}
     atlas_png, pixels, painted = paint_atlas(paint_source, selected, before, source_mask, photo, photo_mask,
-                                             affine, strength, seam=seam, with_mask=True)
+                                             affine, strength, seam=seam, with_mask=True, cover=cover)
     texel_mask = painted['mask']
+    if cover is not None:
+        cover_report['hidden_texture_pixels_painted'] = pixels.pop('hidden_texture_pixels_painted')
+    coverage = coverage_mask(source, before, source_lm, texel_mask, window)
+    coverage_report = {'values': {'written': COVER_WRITTEN, 'face_area_not_written': COVER_MISSED, 'outside_face_area': COVER_OUTSIDE},
+                       'face_area': 'texels inside the source face-oval landmarks, at most depth_eye_fraction behind the visible surface',
+                       'depth_eye_fraction': COVER_DEPTH,
+                       'written_texels': int((coverage == COVER_WRITTEN).sum()),
+                       'face_area_not_written_texels': int((coverage == COVER_MISSED).sum())}
+    encoded = io.BytesIO()
+    Image.fromarray(coverage).save(encoded, format='PNG')
+    coverage_png = encoded.getvalue()
     # Texels whose projection lands within .15 eye spans of the photo's eyes,
     # brows or lips: their mask edges are eye sockets and lids, not skin seams.
     distance, span = feature_distance(photo_lm, photo.shape, affine, before['rgb'].shape)
     feature_texels = np.zeros(texel_mask.shape, dtype=bool)
     feature_texels[painted['texels']] = _sample(distance, painted['screen'], order=0) < .15
-    output = partition_glb(source, selected, atlas_png, body_atlas_png=body_atlas_png)
+    output = partition_glb(source, selected, atlas_png, body_atlas_png=body_atlas_png, coverage_png=coverage_png,
+                           meta={'version': VERSION, 'cover_folds': cover_folds,
+                                 'coverage_mask': {k: v for k, v in coverage_report.items() if k != 'face_area'}})
     doc, binary = parse_glb(output)
     original_doc = source['gltf']
     primitives = doc['meshes'][0]['primitives']
@@ -1566,7 +1743,7 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
     protected_changes = int((np.any(expected_body['rgb'] != after['rgb'], axis=2) & protected).sum())
     if protected_changes:
         raise FaceTextureError('Internal protected-body render isolation check failed')
-    report = {'schema_version': 2, 'status': 'face_texture_only',
+    report = {'schema_version': 2, 'node_version': VERSION, 'status': 'face_texture_only',
         'method': 'Fresh CPU MediaPipe RGB detection and semantics; orthographic visible-triangle photo projection; append-only private atlas',
         'source_sha256': hashlib.sha256(source['raw']).hexdigest(), 'output_sha256': hashlib.sha256(output).hexdigest(),
         'reference_file_sha256': hashlib.sha256(reference_image.read_bytes()).hexdigest(),
@@ -1585,7 +1762,8 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
         'source_semantics': source_semantics, 'reference_semantics': photo_semantics,
         'camera': {'kind': 'orthographic albedo; Y-up; yaw=0 views from +Z', 'yaw_degrees': view['yaw_degrees'],
                    'head_bounds_xy': view['bounds'], 'full_bounds_xy': full_view['bounds'], 'resolution': render_resolution},
-        'strength': float(strength), **pixels, 'seam_blend': seam_report,
+        'strength': float(strength), **pixels, 'seam_blend': seam_report, 'cover_folds': cover_report,
+        'coverage_mask': coverage_report,
         'limitations': ['Planar affine does not undo photographic perspective or expression differences.',
                         'Landmarks and semantic probabilities are observations, not anatomical reconstruction.',
                         'No vertex positions, UVs, normals, tangents or original image bytes are changed.']}
@@ -1600,6 +1778,8 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
         encoded = io.BytesIO()
         Image.fromarray(np.rint(texel_mask*255).clip(0, 255).astype(np.uint8)).save(encoded, format='PNG')
         files.append((projection_mask_png, encoded.getvalue()))
+    if coverage_mask_png is not None:
+        files.append((coverage_mask_png, coverage_png))
     _write_outputs(files)
     return report
 

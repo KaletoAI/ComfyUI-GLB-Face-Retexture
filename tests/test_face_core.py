@@ -39,11 +39,13 @@ def texel_for(photo_value, factor):
     return int(np.rint(linear_to_srgb(srgb_to_linear(photo_value) / factor)))
 
 
-def fixture(path, change=None):
-    """Two separately indexed triangles intentionally share every UV texel."""
-    positions = np.array([[-.8, -.8, 1], [.8, -.8, 1], [0, .8, 1],
-                          [-.8, -.8, 0], [.8, -.8, 0], [0, .8, 0]], dtype='<f4')
-    uv = np.array([[.1, .1], [.9, .1], [.5, .9]] * 2, dtype='<f4')
+def fixture(path, change=None, positions=None, uv=None):
+    """Two separately indexed triangles intentionally share every UV texel (unless given)."""
+    if positions is None:
+        positions = [[-.8, -.8, 1], [.8, -.8, 1], [0, .8, 1], [-.8, -.8, 0], [.8, -.8, 0], [0, .8, 0]]
+    if uv is None:
+        uv = [[.1, .1], [.9, .1], [.5, .9]] * 2
+    positions, uv = np.array(positions, dtype='<f4'), np.array(uv, dtype='<f4')
     normals = np.array([[0, 0, 1]] * 6, dtype='<f4')
     indices = np.arange(6, dtype='<u4')
     png = io.BytesIO()
