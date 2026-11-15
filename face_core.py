@@ -294,6 +294,19 @@ def _read_source(path):
             'atlas': atlas, 'factor': factor, 'sampler': sampler}
 
 
+def read_photo(path):
+    """Decode the reference photo as RGB; unreadable or oversized files are input errors."""
+    try:
+        with Image.open(path) as image:
+            if image.width * image.height > MAX_TEXTURE_PIXELS:
+                raise FaceTextureError('Reference photo exceeds ' + str(MAX_TEXTURE_PIXELS) + ' pixels')
+            return np.array(ImageOps.exif_transpose(image).convert('RGB'))
+    except FaceTextureError:
+        raise
+    except (OSError, ValueError, Image.DecompressionBombError) as error:
+        raise FaceTextureError('Reference photo cannot be decoded: ' + str(error)) from None
+
+
 def make_view(positions, resolution, yaw, bounds=None):
     angle = math.radians(yaw)
     rotation = np.array([[math.cos(angle), 0, -math.sin(angle)],
@@ -328,13 +341,7 @@ def _raster_batch(triangles, width, height, centers, budget=1 << 20):
     ids = np.flatnonzero((size > 0).all(axis=1) & (np.abs(determinant) >= 1e-10))
     counts = size[ids, 0] * size[ids, 1]
     ends = np.cumsum(counts)
-    first = 0
-    while first < len(ids):
-        done = ends[first-1] if first else 0
-        last = max(int(np.searchsorted(ends, done + budget, side='right')), first + 1)
-        chunk, chunk_counts = ids[first:last], counts[first:last]
-        tri = np.repeat(chunk, chunk_counts)
-        offset = np.arange(int(chunk_counts.sum())) - np.repeat(np.cumsum(chunk_counts) - chunk_counts, chunk_counts)
+    def rows(tri, offset):
         columns = size[tri, 0]
         points = low[tri] + np.c_[offset % columns, offset // columns]
         delta = points + centers - triangles[tri, 0]
@@ -342,7 +349,24 @@ def _raster_batch(triangles, width, height, centers, budget=1 << 20):
         v = (e1[tri, 0]*delta[:, 1] - e1[tri, 1]*delta[:, 0]) / determinant[tri]
         bary = np.c_[1-u-v, u, v]
         inside = (bary >= -1e-7).all(axis=1)
-        yield tri[inside], points[inside], bary[inside]
+        return tri[inside], points[inside], bary[inside]
+    first = 0
+    while first < len(ids):
+        done = ends[first-1] if first else 0
+        last = max(int(np.searchsorted(ends, done + budget, side='right')), first + 1)
+        chunk, chunk_counts = ids[first:last], counts[first:last]
+        if len(chunk) == 1 and chunk_counts[0] > budget:
+            # A triangle larger than the budget goes in bands of whole rows,
+            # in the same row-major order as an unsplit chunk.
+            columns, height_rows = size[chunk[0]]
+            step = max(1, budget // columns)
+            for row in range(0, height_rows, step):
+                offset = np.arange(row*columns, min(row+step, height_rows)*columns)
+                yield rows(np.full(len(offset), chunk[0]), offset)
+        else:
+            tri = np.repeat(chunk, chunk_counts)
+            offset = np.arange(int(chunk_counts.sum())) - np.repeat(np.cumsum(chunk_counts) - chunk_counts, chunk_counts)
+            yield rows(tri, offset)
         first = last
 
 
@@ -487,7 +511,10 @@ def detect_face(detector, mp, rgb, label, locate_only=False, mesh_render=False):
             lm[:, 0] = (x0 + lm[:, 0]*(x1-x0))/width
             lm[:, 1] = (y0 + lm[:, 1]*(y1-y0))/height
             lm[:, 2] *= (x1-x0)/width
-            found.append(lm)
+            # MediaPipe can report the same face twice in one view (noses a
+            # pixel apart). That is one face, not a second person.
+            if not any(np.linalg.norm((lm[1, :2]-old[1, :2])*[width, height]) < .35*eye_span(old) for old in found):
+                found.append(lm)
         if len(found) > 1 and confirm and mesh_render:
             found = [lm for lm in found if confirmed(image, lm, kind)]
         if len(found) > 1 and confirm:
@@ -520,7 +547,8 @@ def detect_face(detector, mp, rgb, label, locate_only=False, mesh_render=False):
         image, prefix = np.repeat(np.rint(rgb @ [.299, .587, .114]).astype(np.uint8)[..., None], 3, axis=2), 'luminance_'
         found = search(image, prefix)
     if len(found) != 1:
-        raise FaceTextureError(label + ': no unique usable face detected; use a matching frontal photo or correct source yaw')
+        what = 'no usable face detected' if not found else str(len(found)) + ' separate faces detected, expected one'
+        raise FaceTextureError(label + ': ' + what + '; use a matching frontal photo or correct source yaw')
     initial = found[0]
     box = _face_box(initial, width, height)
     refined = detect(image, box, prefix+'detected_bbox_refinement')
@@ -535,9 +563,11 @@ def detect_face(detector, mp, rgb, label, locate_only=False, mesh_render=False):
         # uses the strict detection on the native head re-render.
         chosen = initial
     span = eye_span(chosen)
-    if span < 12:
+    # A locating detection only places the native head re-render, which
+    # extends past the image border and repeats both checks strictly.
+    if span < 12 and not locate_only:
         raise FaceTextureError(label + ': native outer-eye span is below 12 pixels')
-    if np.any(chosen[[33, 263, 152], :2] <= 0) or np.any(chosen[[33, 263, 152], :2] >= 1):
+    if (np.any(chosen[[33, 263, 152], :2] <= 0) or np.any(chosen[[33, 263, 152], :2] >= 1)) and not locate_only:
         raise FaceTextureError(label + ': registration anchors outside the image')
     eye = chosen[263, :2]-chosen[33, :2]
     lateral = abs(np.dot(chosen[1, :2]-(chosen[263, :2]+chosen[33, :2])/2, eye/np.linalg.norm(eye)))/np.linalg.norm(eye)
@@ -1256,11 +1286,15 @@ def _material_atlas(doc, binary, material_index):
 def _write_outputs(files):
     """Stage every output beside its target; publish only after all writes succeed."""
     staged, published = [], []
+    umask = os.umask(0)
+    os.umask(umask)
     try:
         for path, data in files:
             path.parent.mkdir(parents=True, exist_ok=True)
             descriptor, name = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
             staged.append((Path(name), path))
+            # mkstemp creates 0600; a published file gets the mode open() would give.
+            os.chmod(name, 0o666 & ~umask)
             with os.fdopen(descriptor, 'wb') as handle:
                 handle.write(data)
         for temporary, path in staged:
@@ -1315,6 +1349,13 @@ def _crop_bounds(view, box):
     return (center_x-half_span, center_y-half_span, center_x+half_span, center_y+half_span)
 
 
+def _model_xy(view, xy):
+    """Model-space camera-plane coordinates of image-normalised points of `view`."""
+    left, bottom, right, top = view['bounds']
+    xy = np.asarray(xy, dtype=float)
+    return np.c_[left + xy[..., 0]*(right-left), top - xy[..., 1]*(top-bottom)].reshape(xy.shape)
+
+
 def _full_row(view, full_view, landmarks):
     """Full-render pixel row of the nose tip detected in `view`."""
     left, bottom, right, top = view['bounds']
@@ -1324,7 +1365,35 @@ def _full_row(view, full_view, landmarks):
 
 
 def observe_source(detector, mp, source, render_resolution, yaw):
-    """Locate the head in a full render, re-render it natively and detect its landmarks."""
+    """Locate the head in a full render, re-render it natively and detect its landmarks.
+
+    A mesh exported facing -Z or ±X shows no face at the requested yaw; then the
+    other three quarter turns are tried and the one used is recorded.
+    """
+    try:
+        return _observe_source(detector, mp, source, render_resolution, yaw)
+    except FaceTextureError as error:
+        failures = [{'yaw_degrees': float(yaw), 'error': str(error)}]
+    for turn in (180, 90, -90):
+        other = float((yaw + turn + 180) % 360 - 180)
+        try:
+            observed = list(_observe_source(detector, mp, source, render_resolution, other))
+        except FaceTextureError as error:
+            failures.append({'yaw_degrees': other, 'error': str(error)})
+            continue
+        observed[2] = dict(observed[2], yaw_fallback={'requested_degrees': float(yaw), 'used_degrees': other,
+                                                      'failures': failures})
+        return tuple(observed)
+    extent = np.ptp(source['positions'], axis=0)
+    hint = ''
+    if extent.max() > 1.2*extent[1]:
+        hint = ('; the mesh is longest along ' + 'XYZ'[int(np.argmax(extent))]
+                + ' but the node expects an upright Y-up mesh')
+    tried = ', '.join('%g' % failure['yaw_degrees'] for failure in failures[1:])
+    raise FaceTextureError(failures[0]['error'] + ' (also tried yaw ' + tried + ' degrees)' + hint)
+
+
+def _observe_source(detector, mp, source, render_resolution, yaw):
     full_view = make_view(source['positions'], render_resolution, yaw)
     full_render = render_albedo(source, full_view)
     head = head_window(full_render['owners'])
@@ -1367,6 +1436,13 @@ def observe_source(detector, mp, source, render_resolution, yaw):
     before = render_albedo(source, view)
     source_lm, source_box, source_observation = detect_face(detector, mp, before['rgb'], 'Refined source head render',
                                                              mesh_render=True)
+    # The re-render must show the face that placed its camera, not another one
+    # (e.g. a crop clamped at the render border that slid onto other texture).
+    first, second = _model_xy(locate_view, initial_lm[[1, 33, 263], :2]), _model_xy(view, source_lm[[1, 33, 263], :2])
+    span_first, span_second = (float(np.linalg.norm(points[2]-points[1])) for points in (first, second))
+    if (np.linalg.norm(first[0]-second[0]) > .5*span_second
+            or not .6 <= span_first/max(span_second, 1e-12) <= 1/.6):
+        raise FaceTextureError('Refined source head render: the head re-render shows a different face than the locating render')
     return full_view, full_render, full_observation, view, before, source_lm, source_box, source_observation
 
 
@@ -1405,8 +1481,7 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
         if not model.is_file():
             raise FaceTextureError('Missing local CPU model: '+str(model)+'; run python install.py')
     source = read_source(source_glb)
-    with Image.open(reference_image) as image:
-        photo = np.array(ImageOps.exif_transpose(image).convert('RGB'))
+    photo = read_photo(reference_image)
     reference_rgb_hash = hashlib.sha256(np.asarray(photo.shape, dtype='<u4').tobytes() + photo.tobytes()).hexdigest()
     import mediapipe as mp
     from mediapipe.tasks import python
@@ -1508,7 +1583,7 @@ def run_retexture(source_glb: Path, reference_image: Path, output_glb: Path,
         'registration': registration, 'photo_observation': photo_observation,
         'source_full_observation': full_observation, 'source_observation': source_observation,
         'source_semantics': source_semantics, 'reference_semantics': photo_semantics,
-        'camera': {'kind': 'orthographic albedo; Y-up; yaw=0 views from +Z', 'yaw_degrees': float(yaw),
+        'camera': {'kind': 'orthographic albedo; Y-up; yaw=0 views from +Z', 'yaw_degrees': view['yaw_degrees'],
                    'head_bounds_xy': view['bounds'], 'full_bounds_xy': full_view['bounds'], 'resolution': render_resolution},
         'strength': float(strength), **pixels, 'seam_blend': seam_report,
         'limitations': ['Planar affine does not undo photographic perspective or expression differences.',
@@ -1666,6 +1741,10 @@ def run_locate(source_glb: Path, output_glb: Path, preview_png: Path, proof_json
     if not face_model.is_file():
         raise FaceTextureError('Missing local CPU model: '+str(face_model)+'; run python install.py')
     source = read_source(source_glb)
+    labelled = sorted({'_FACE_REGION', '_FACE_DEPTH'} & set(source['primitive']['attributes']))
+    if labelled or 'glb_face_regions' in source['gltf'].get('extras', {}):
+        raise FaceTextureError('Source GLB already carries face region labels (' + ', '.join(labelled or ['extras.glb_face_regions'])
+                               + '); label the original unlabelled GLB')
     import mediapipe as mp
     from mediapipe.tasks import python
     from mediapipe.tasks.python import vision
@@ -1734,7 +1813,7 @@ def run_locate(source_glb: Path, output_glb: Path, preview_png: Path, proof_json
               'regions': regions, 'region_margins_eye_fraction': {name: margin for _, name, _, margin in REGIONS},
               'eye_span_render_pixels': span, 'source_full_observation': full_observation,
               'source_observation': observation,
-              'camera': {'kind': 'orthographic albedo; Y-up; yaw=0 views from +Z', 'yaw_degrees': float(yaw),
+              'camera': {'kind': 'orthographic albedo; Y-up; yaw=0 views from +Z', 'yaw_degrees': view['yaw_degrees'],
                          'head_bounds_xy': view['bounds'], 'full_bounds_xy': full_view['bounds'], 'resolution': render_resolution},
               'extras': extras}
     _write_outputs([(outputs[0], output),

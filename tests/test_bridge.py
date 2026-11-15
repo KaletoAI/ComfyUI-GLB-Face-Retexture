@@ -18,6 +18,18 @@ if WORKER_IMPORT_ERROR is None:
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 
 
+def worker_arguments(command):
+    """Parse a bridge command with worker.py's own parser, as the worker does."""
+    sys.path.insert(0, str(PACKAGE_DIR))
+    try:
+        spec = importlib.util.spec_from_file_location("glb_face_retexture_worker", PACKAGE_DIR / "worker.py")
+        worker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(worker)
+    finally:
+        sys.path.remove(str(PACKAGE_DIR))
+    return worker.argument_parser().parse_args(command[6:])
+
+
 class FakeTensor:
     """The small slice of torch.Tensor the bridge touches."""
 
@@ -130,12 +142,13 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(list(schema["optional"]), list(controls))
         self.assertIs(schema["optional"]["seam_blend"][1]["default"], True)
         def worker(command, **kwargs):
+            arguments = worker_arguments(command)
             for name, value in controls.items():
-                argument = command[command.index("--" + name.replace("_", "-"))+1]
+                argument = getattr(arguments, name)
                 if isinstance(value, bool):
                     self.assertEqual(argument, "true" if value else "false")
                 else:
-                    self.assertEqual(float(argument), value)
+                    self.assertEqual(argument, value)
             return 1, "", "checked controls"
         with self.assertRaisesRegex(RuntimeError, "checked controls"):
             self.run_node(worker, **controls)
@@ -161,8 +174,8 @@ class BridgeTests(unittest.TestCase):
         def worker(command, **kwargs):
             self.assertIn("--locate", command)
             self.assertNotIn("--reference-image", command)
+            self.assertEqual(worker_arguments(command).depth_window, .4)
             arguments = dict(zip(command, command[1:]))
-            self.assertEqual(float(arguments["--depth-window"]), .4)
             Path(arguments["--output-glb"]).write_bytes(b"glTF regions")
             Image.new("RGB", (5, 3)).save(arguments["--preview-png"])
             Path(arguments["--proof-json"]).write_text(json.dumps({"status": "face_regions_only"}), encoding="utf-8")
@@ -214,6 +227,77 @@ class BridgeTests(unittest.TestCase):
             self.run_node(worker, image=FakeTensor(np.zeros((2, 8, 8, 3), dtype=np.float32)))
         with self.assertRaisesRegex(ValueError, "static textured GLB"):
             self.run_node(worker, source=File3D(str(self.root / "model.obj")))
+
+    def work_dirs(self):
+        return sorted((self.root / "temp").glob("glb_face_retexture_*"))
+
+    def succeed(self, command, **kwargs):
+        arguments = dict(zip(command, command[1:]))
+        Path(arguments["--output-glb"]).write_bytes(b"glTF output")
+        Image.new("RGB", (6, 4)).save(arguments["--comparison-png"])
+        Path(arguments["--proof-json"]).write_text("{}", encoding="utf-8")
+        Image.new("L", (3, 1)).save(arguments["--projection-mask-png"])
+        (kwargs["log_dir"] / "worker.stderr.log").write_text("log", encoding="utf-8")
+        return 0, "", ""
+
+    def test_negative_exponent_values_reach_the_worker(self):
+        """str(-1e-05) starts with "-" and an exponent; argparse took it for an option."""
+        def worker(command, **kwargs):
+            arguments = worker_arguments(command)
+            self.assertEqual((arguments.yaw, arguments.light_balance), (-1e-05, 1e-07))
+            return 1, "", "parsed"
+        node = self.bridge.GLBFaceRetexture()
+        with patch.object(self.bridge, "worker_python", return_value=Path(sys.executable)), \
+                patch.object(self.bridge, "MODELS", ()), patch.object(self.bridge, "run_worker", worker), \
+                self.assertRaisesRegex(RuntimeError, "parsed"):
+            node.retexture(File3D(str(self.source)), self.image, 1.0, .18, 256, -1e-05, light_balance=1e-07)
+
+    def test_success_keeps_only_the_returned_glb(self):
+        glb = self.run_node(self.succeed, source=File3D(str(self.source)))["result"][0]
+        (work_dir,) = self.work_dirs()
+        self.assertEqual([path.name for path in work_dir.iterdir()], ["GLBFaceRetexture.glb"])
+        self.assertEqual(Path(glb.get_source()).read_bytes(), b"glTF output")
+        self.assertTrue(self.source.is_file())
+
+    def test_failure_and_cancel_remove_the_work_directory(self):
+        def cancelled(command, **kwargs):
+            raise KeyboardInterrupt
+        with self.assertRaises(RuntimeError):
+            self.run_node(lambda command, **kwargs: (1, "", "boom"))
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_node(cancelled)
+        self.assertEqual(self.work_dirs(), [])
+
+    def test_input_error_shows_only_its_message(self):
+        stderr = ("W0000 00:00:1763241000.1 1 inference_feedback_manager.cc:114] Feedback manager requires a model\n"
+                  "WARNING: All log messages before absl::InitializeLog() is called are written to STDERR\n"
+                  "FaceTextureError: Source mesh render: no usable face detected\n")
+        with self.assertRaises(RuntimeError) as caught:
+            self.run_node(lambda command, **kwargs: (3, "", stderr))
+        self.assertEqual(str(caught.exception), "GLBFaceRetexture: Source mesh render: no usable face detected")
+
+    def test_crash_details_drop_mediapipe_log_noise(self):
+        stderr = ("I0000 00:00:1763241000.1 1 gl_context.cc:369] GPU suport is not available\n"
+                  "/venv/image_segmenter.py:158: UserWarning: MessageFactory class is deprecated.\n"
+                  "  graph_config = self._runner.get_graph_config()\n"
+                  "Traceback (most recent call last):\n  File \"face_core.py\", line 1\nMemoryError\n")
+        with self.assertRaises(RuntimeError) as caught:
+            self.run_node(lambda command, **kwargs: (1, "", stderr))
+        message = str(caught.exception)
+        self.assertIn("Traceback (most recent call last):\n  File \"face_core.py\", line 1\nMemoryError", message)
+        for noise in ("GPU suport", "UserWarning", "graph_config"):
+            self.assertNotIn(noise, message)
+
+    def test_worker_refuses_a_replaced_model(self):
+        spec = importlib.util.spec_from_file_location("glb_face_retexture_runtime", PACKAGE_DIR / "worker_runtime.py")
+        runtime = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runtime)
+        models = self.root / "models"
+        models.mkdir()
+        runtime.verify_models(models)  # Missing files are reported elsewhere.
+        (models / runtime.MODELS[0][0]).write_bytes(b"not the pinned model")
+        with self.assertRaisesRegex(RuntimeError, "pinned SHA-256"):
+            runtime.verify_models(models)
 
 
 if __name__ == "__main__":

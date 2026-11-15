@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.7.0 — 2026-11-15
+
+Fixes from a review of the whole code base. Every input that succeeded with 1.6.1 gives byte-identical GLB, comparison and proof (portrait grid and cyan luminance case compared).
+
+- **Yaw fallback.** When the requested `yaw` finds no face on the mesh, yaw + 180, + 90 and − 90 are tried and the first that works is used; the proof records `yaw_fallback` with every failed attempt, and the camera block names the yaw used. The job mesh of 1.6.1 rotated by 180° is found at yaw −180. If every turn fails and the mesh is clearly longest along X or Z, the error says the node expects an upright Y-up mesh.
+- **Same face in both views.** The native head re-render must show the face that placed its camera: nose within 0.5 eye spans and eye span within ×0.6–1.67 of the locating detection, both in model units. On the portrait grid, the cyan case and the 1.6.1 job mesh the measured deviation was at most 0.02 eye spans and 2 %.
+- **One face reported twice** in a single view (noses within 0.35 eye spans) counts as one face. A 200 px face low in the render was reported twice by MediaPipe and refused as "multiple faces".
+- **Small faces when locating.** The 12 px eye-span and anchors-inside-the-image checks now apply only where landmarks drive registration (photo, head re-render), not to the detection that merely places the head camera.
+- **Worker arguments.** Numeric values are passed as `--name=value`; `--yaw -1e-05` was read by argparse as an option and the worker refused to start. `worker.py` exposes `argument_parser()`.
+- **Clean error messages.** A refused input (`FaceTextureError`) leaves the worker with exit code 3 and one `FaceTextureError: …` line; the node shows just that message. Other failures keep the traceback without MediaPipe log lines and Python warnings.
+- **Work directories.** A failed or cancelled run removes its `glb_face_retexture_*` directory; a successful run keeps only the returned GLB, which `FILE_3D` references by path.
+- **Model check.** The worker refuses a model file whose SHA-256 differs from the pinned download.
+- **GLB Face Regions** refuses a GLB that already carries `_FACE_REGION`/`_FACE_DEPTH` or `extras.glb_face_regions` instead of failing in the export check.
+- Smaller fixes: an unreadable or oversized (> 67,108,864 px) reference photo is a `FaceTextureError`; outputs get the normal umask permissions instead of 0600; the error for several candidate faces states their number; a triangle whose bounding box exceeds the raster budget is rasterised in row bands (same rows in the same order) instead of allocating it whole.
+- 14 new tests: bridge (negative exponent values through the real parser, cleanup on success/failure/cancel, input-error message, log filtering, model hash) and core (double report, small locating face, yaw fallback and hint, view consistency, labelled GLB, bad photo, file mode, raster bands).
+
 ## 1.6.1 — 2026-11-15
 
 - Find the head before trusting a face in the full source render. On a full-body character (head about 70 px wide in the 768 px render, stylised black eyes) the head was missed and the chest, with the nipples as eyes, was the only "face", so the photo was painted onto the chest (job d2d91062). The head is now read from the silhouette of the full render: going down from the top, head, narrower neck, then a shoulder row at least 1.6 head widths wide. A face whose nose lies below that row is discarded, and a native render of head and neck is searched instead; the same happens when the full render finds no face at all. There the job's head was found with the nose 52 px above the shoulder row. A face that is still below the shoulders is refused.

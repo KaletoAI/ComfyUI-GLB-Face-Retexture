@@ -5,10 +5,15 @@ from pathlib import Path
 import sys
 import traceback
 
-from worker_runtime import installer_command, private_venv_directory, validate_worker_identity, worker_python
+from worker_runtime import installer_command, private_venv_directory, validate_worker_identity, verify_models, worker_python
 
 
-def main():
+# Exit status for a refused input (FaceTextureError); stderr then holds one
+# "FaceTextureError: <message>" line, which the node shows without a traceback.
+INPUT_ERROR = 3
+
+
+def argument_parser():
     parser = argparse.ArgumentParser(description="Face-only texture projection with unchanged source geometry.")
     parser.add_argument("--locate", action="store_true",
                         help="Only label the face regions of every vertex (no photo); writes --preview-png.")
@@ -30,6 +35,11 @@ def main():
     parser.add_argument("--skin-recolor", type=float, default=0.0)
     parser.add_argument("--seam-blend", choices=("true", "false"), default="true")
     parser.add_argument("--projection-mask-png", type=Path)
+    return parser
+
+
+def main():
+    parser = argument_parser()
     arguments = parser.parse_args()
     if arguments.locate and arguments.preview_png is None:
         parser.error("--locate requires --preview-png")
@@ -43,6 +53,7 @@ def main():
             {"version": list(sys.version_info[:2]), "prefix": sys.prefix, "base_prefix": sys.base_prefix},
             private_venv_directory(package_dir),
         )
+        verify_models(arguments.model_dir)
     except (OSError, RuntimeError) as exc:
         print(f"GLBFaceRetexture refuses this worker environment: {exc}.\nRun: {repair}", file=sys.stderr)
         return 2
@@ -75,7 +86,11 @@ def main():
     except ImportError as exc:
         print(f"GLBFaceRetexture CPU dependency unavailable in {sys.executable}: {exc}.\nRun: {repair}", file=sys.stderr)
         return 2
-    except Exception:
+    except Exception as exc:
+        face_core = sys.modules.get("face_core")
+        if face_core is not None and isinstance(exc, face_core.FaceTextureError):
+            print(f"FaceTextureError: {exc}", file=sys.stderr)
+            return INPUT_ERROR
         traceback.print_exc()
         return 1
     return 0

@@ -3,10 +3,12 @@ import copy
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import struct
 import tempfile
 import unittest
+from unittest.mock import patch
 
 WORKER_IMPORT_ERROR = None
 try:
@@ -536,6 +538,129 @@ class HeadPriorTests(unittest.TestCase):
     def test_no_face_on_the_head_is_refused(self):
         with self.assertRaisesRegex(core.FaceTextureError, 'Source mesh render'):
             self.observe([_CHEST_GHOST], _SmallHeadDetector())
+
+
+
+class _TwiceDetector(_PareidoliaDetector):
+    """MediaPipe sometimes reports one face twice, noses a pixel apart."""
+
+    def detect(self, image):
+        result = super().detect(image)
+        twins = []
+        for face in result.face_landmarks:
+            twins += [face, [_Point(p.x + .001, p.y + .001) for p in face]]
+        return type('Result', (), {'face_landmarks': twins})()
+
+
+def _shift(lm, dx, dy):
+    lm = np.array(lm, dtype=float)
+    lm[:, 0] += dx
+    lm[:, 1] += dy
+    return lm
+
+
+@unittest.skipIf(WORKER_IMPORT_ERROR is not None, "Standalone ComfyUI worker dependencies unavailable: " + str(WORKER_IMPORT_ERROR))
+class ReviewFindingTests(unittest.TestCase):
+    def test_one_face_reported_twice_is_one_face(self):
+        rgb = np.full((768, 768, 3), 245, np.uint8)
+        rgb[540:580, 365:405] = _REAL
+        for label, options in (('Reference photo', {}), ('Source mesh render', {'mesh_render': True, 'locate_only': True})):
+            with self.subTest(label=label):
+                lm, _, _ = core.detect_face(_TwiceDetector(), _FakeMp, rgb, label, **options)
+                np.testing.assert_allclose(lm[1, :2]*768, (385, 560), atol=1)
+
+    def test_locating_detection_accepts_a_small_face(self):
+        rgb = np.full((768, 768, 3), 245, np.uint8)
+        rgb[100:114, 380:394] = _REAL  # outer-eye span 7 px
+        with self.assertRaisesRegex(core.FaceTextureError, 'below 12 pixels'):
+            core.detect_face(_PareidoliaDetector(), _FakeMp, rgb, 'Refined source head render', mesh_render=True)
+        lm, _, observation = core.detect_face(_PareidoliaDetector(), _FakeMp, rgb, 'Source mesh render',
+                                              locate_only=True, mesh_render=True)
+        self.assertLess(observation['eye_span_pixels'], 12)
+
+    def test_other_quarter_turns_are_tried_when_the_requested_yaw_fails(self):
+        calls = []
+        def observe(detector, mp, source, resolution, yaw):
+            calls.append(yaw)
+            if yaw != 90:
+                raise core.FaceTextureError('Source mesh render: no usable face detected at %g' % yaw)
+            return 'full_view', 'full_render', {'attempts': []}, 'view', 'before', 'lm', 'box', 'observation'
+        source = {'positions': np.array([[0, 0, 0], [1, 2, .5]])}
+        with patch.object(core, '_observe_source', observe):
+            observed = core.observe_source(None, None, source, 768, 0)
+        self.assertEqual(calls, [0, -180, 90])
+        self.assertEqual(observed[2]['yaw_fallback']['used_degrees'], 90)
+        self.assertEqual([f['yaw_degrees'] for f in observed[2]['yaw_fallback']['failures']], [0, -180])
+        calls.clear()
+        lying = {'positions': np.array([[0, 0, 0], [1, .5, 2]])}
+        with patch.object(core, '_observe_source', lambda *a: observe(*a[:4], 45)), \
+                self.assertRaisesRegex(core.FaceTextureError,
+                                       r'at 45 \(also tried yaw -180, 90, -90 degrees\); the mesh is longest along Z'):
+            core.observe_source(None, None, lying, 768, 0)
+
+    def test_head_re_render_must_show_the_locating_face(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'figure.glb'
+            _figure(path, [])
+            source = core.read_source(path)
+        head = _bearded_face(.177)
+        head = np.c_[_shift(head, 0, 0), np.zeros(478)]
+        def run(offset):
+            def detect(detector, mp, rgb, label, **options):
+                if label == 'Source mesh render':
+                    return head, core._face_box(head, 768, 768), {'attempts': []}
+                # The same model points seen through the re-render camera, moved by `offset`.
+                full_view = core.make_view(source['positions'], 768, 0)
+                view = core.make_view(source['positions'], 768, 0,
+                                      core._crop_bounds(full_view, core._face_box(head, 768, 768)))
+                left, bottom, right, top = view['bounds']
+                xy = core._model_xy(full_view, head[:, :2])
+                seen = np.c_[(xy[:, 0]-left)/(right-left), (top-xy[:, 1])/(top-bottom), np.zeros(478)]
+                return _shift(seen, offset, 0), (0, 0, 768, 768), {'attempts': []}
+            with patch.object(core, 'detect_face', detect):
+                return core._observe_source(None, None, source, 768, 0)
+        run(0)
+        with self.assertRaisesRegex(core.FaceTextureError, 'shows a different face'):
+            run(.3)
+
+    def test_labelled_glb_is_refused_before_detection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def label(doc):
+                doc['meshes'][0]['primitives'][0]['attributes']['_FACE_REGION'] = 1
+            fixture(root / 'labelled.glb', label)
+            (root / 'face_landmarker.task').write_bytes(b'model')
+            with self.assertRaisesRegex(core.FaceTextureError, 'already carries face region labels'):
+                core.run_locate(root / 'labelled.glb', root / 'o.glb', root / 'p.png', root / 'p.json', root)
+
+    def test_bad_reference_photo_is_an_input_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'photo.png'
+            path.write_bytes(b'not an image')
+            with self.assertRaisesRegex(core.FaceTextureError, 'cannot be decoded'):
+                core.read_photo(path)
+            Image.new('RGB', (8, 8)).save(path)
+            with patch.object(core, 'MAX_TEXTURE_PIXELS', 63), self.assertRaisesRegex(core.FaceTextureError, 'exceeds'):
+                core.read_photo(path)
+            self.assertEqual(core.read_photo(path).shape, (8, 8, 3))
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX file modes')
+    def test_outputs_get_umask_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'out.bin'
+            core._write_outputs([(path, b'x')])
+            umask = os.umask(0)
+            os.umask(umask)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o666 & ~umask)
+
+    def test_oversized_triangle_is_rasterised_in_bands(self):
+        triangles = np.array([[[0, 0], [700, 10], [30, 650]], [[5, 5], [9, 5], [5, 9]]], dtype=float)
+        whole = [np.concatenate(c) for c in zip(*core._raster_batch(triangles, 720, 720, .5))]
+        parts = list(core._raster_batch(triangles, 720, 720, .5, budget=4096))
+        self.assertGreater(len(parts), 50)
+        self.assertLessEqual(max(len(part[0]) for part in parts), 4096)
+        for a, b in zip(whole, (np.concatenate(c) for c in zip(*parts))):
+            np.testing.assert_array_equal(a, b)
 
 
 if __name__ == '__main__':

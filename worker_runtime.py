@@ -1,5 +1,6 @@
 """Stdlib-only paths and safety checks shared by the node, worker, and installer."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -106,6 +107,14 @@ def validate_worker_identity(identity: dict, venv: Path) -> None:
     prefix = Path(identity["prefix"]).resolve()
     if prefix != venv.resolve() or prefix == Path(identity["base_prefix"]).resolve():
         raise RuntimeError("Refusing an interpreter outside this package's private .venv.")
+
+
+def verify_models(model_dir: Path) -> None:
+    """Refuse a present model file whose bytes differ from the pinned download."""
+    for filename, _, digest in MODELS:
+        path = Path(model_dir) / filename
+        if path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise RuntimeError(f"{path} does not match its pinned SHA-256; the model file is corrupt or replaced.")
 
 
 def probe_python(command: list[str]) -> dict:
