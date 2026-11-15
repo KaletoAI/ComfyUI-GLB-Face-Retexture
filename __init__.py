@@ -3,6 +3,8 @@
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import tempfile
 
@@ -18,6 +20,9 @@ from .worker_runtime import MODELS, installer_command, run_worker, worker_enviro
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_TIMEOUT_SECONDS = 1800
+INPUT_ERROR = 3  # worker.py: refused input, stderr holds "FaceTextureError: <message>"
+# MediaPipe/absl log lines ("W0000 00:00:...") and Python warnings with their source line.
+_LOG_NOISE = re.compile(r"^(?:[IWEF]\d{4} \d\d:\d\d:\d\d|WARNING: All log messages before absl|\S+:\d+: \w*Warning: )")
 
 
 def worker_timeout() -> float:
@@ -70,6 +75,13 @@ class GLBFaceRetexture:
         if reference_image.ndim != 4 or reference_image.shape[0] != 1 or reference_image.shape[-1] != 3:
             raise ValueError("GLBFaceRetexture requires exactly one RGB reference image, not an image batch.")
         python, repair, model_dir, work_dir = _prepare()
+        with _workspace(work_dir) as keep:
+            return self._retexture(python, repair, model_dir, work_dir, keep, source_glb, reference_image, strength,
+                                   feather, render_resolution, yaw, light_balance, tone_match, brightness,
+                                   skin_recolor, seam_blend)
+
+    def _retexture(self, python, repair, model_dir, work_dir, keep, source_glb, reference_image, strength, feather,
+                   render_resolution, yaw, light_balance, tone_match, brightness, skin_recolor, seam_blend):
         source_path = _source_path(source_glb, work_dir)
 
         reference_path = work_dir / "reference.png"
@@ -84,14 +96,15 @@ class GLBFaceRetexture:
             "--source-glb", str(source_path), "--reference-image", str(reference_path),
             "--output-glb", str(output_path), "--comparison-png", str(comparison_path),
             "--proof-json", str(proof_path), "--model-dir", str(model_dir),
-            "--strength", str(strength), "--feather", str(feather),
-            "--render-resolution", str(render_resolution), "--yaw", str(yaw),
-            "--light-balance", str(light_balance), "--tone-match", str(tone_match), "--brightness", str(brightness),
-            "--skin-recolor", str(skin_recolor),
+            f"--strength={strength}", f"--feather={feather}",
+            f"--render-resolution={render_resolution}", f"--yaw={yaw}",
+            f"--light-balance={light_balance}", f"--tone-match={tone_match}", f"--brightness={brightness}",
+            f"--skin-recolor={skin_recolor}",
             "--seam-blend", "true" if seam_blend else "false", "--projection-mask-png", str(mask_path),
         ]
         _run(command, python, repair, work_dir, (output_path, comparison_path, proof_path, mask_path))
         proof_text = json.dumps(json.loads(proof_path.read_text(encoding="utf-8")), ensure_ascii=False, indent=2)
+        keep.append(output_path)
         return {"ui": {"text": [proof_text]},
                 "result": (Types.File3D(str(output_path)), _image(comparison_path), proof_text, _image(mask_path))}
 
@@ -107,6 +120,40 @@ def _prepare():
     folder_paths_temp = Path(folder_paths.get_temp_directory())
     folder_paths_temp.mkdir(parents=True, exist_ok=True)
     return python, repair, model_dir, Path(tempfile.mkdtemp(prefix="glb_face_retexture_", dir=folder_paths_temp))
+
+
+class _workspace:
+    """Remove a node's work directory on failure or cancel; on success keep only
+    the files appended to the yielded list (the returned GLB, which FILE_3D
+    references by path). Images and proof are already loaded into memory."""
+
+    def __init__(self, work_dir):
+        self.work_dir, self.keep = work_dir, []
+
+    def __enter__(self):
+        return self.keep
+
+    def __exit__(self, kind, value, traceback):
+        if kind is not None:
+            shutil.rmtree(self.work_dir, ignore_errors=True)
+            return False
+        kept = {path.resolve() for path in self.keep}
+        for path in self.work_dir.iterdir():
+            if path.resolve() not in kept:
+                shutil.rmtree(path, ignore_errors=True) if path.is_dir() else path.unlink(missing_ok=True)
+        return False
+
+
+def _worker_details(stdout, stderr):
+    """The worker's error without MediaPipe log lines and Python warning noise."""
+    lines, skip = [], False
+    for line in stderr.splitlines():
+        if skip and line.startswith((" ", "\t")):
+            continue
+        skip = bool(_LOG_NOISE.match(line))
+        if not skip and line.strip():
+            lines.append(line)
+    return "\n".join(lines).strip() or stdout.strip() or "Worker produced no error details."
 
 
 def _source_path(source_glb, work_dir):
@@ -138,9 +185,12 @@ def _run(command, python, repair, work_dir, outputs):
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"GLBFaceRetexture CPU worker exceeded {timeout:g} s and was stopped. "
                            "Lower render_resolution or raise GLB_FACE_RETEXTURE_TIMEOUT.") from exc
+    if returncode == INPUT_ERROR:
+        messages = [line[len("FaceTextureError: "):] for line in stderr.splitlines() if line.startswith("FaceTextureError: ")]
+        if messages:
+            raise RuntimeError(f"GLBFaceRetexture: {messages[-1]}")
     if returncode:
-        details = stderr.strip() or stdout.strip() or "Worker produced no error details."
-        raise RuntimeError(f"GLBFaceRetexture CPU worker failed (exit {returncode}):\n{details}")
+        raise RuntimeError(f"GLBFaceRetexture CPU worker failed (exit {returncode}):\n{_worker_details(stdout, stderr)}")
     for output in outputs:
         if not output.is_file() or output.stat().st_size == 0:
             raise RuntimeError(f"GLBFaceRetexture worker did not produce its required output: {output}")
@@ -178,6 +228,10 @@ class GLBFaceRegions:
     def locate(self, source_glb, render_resolution, yaw, depth_window=0.3):
         _source_path(source_glb, None)
         python, repair, model_dir, work_dir = _prepare()
+        with _workspace(work_dir) as keep:
+            return self._locate(python, repair, model_dir, work_dir, keep, source_glb, render_resolution, yaw, depth_window)
+
+    def _locate(self, python, repair, model_dir, work_dir, keep, source_glb, render_resolution, yaw, depth_window):
         source_path = _source_path(source_glb, work_dir)
         output_path = work_dir / "GLBFaceRegions.glb"
         preview_path = work_dir / "regions.png"
@@ -186,10 +240,11 @@ class GLBFaceRegions:
             python, "-E", "-s", "-X", "utf8", str(PACKAGE_DIR / "worker.py"), "--locate",
             "--source-glb", str(source_path), "--output-glb", str(output_path),
             "--preview-png", str(preview_path), "--proof-json", str(proof_path), "--model-dir", str(model_dir),
-            "--render-resolution", str(render_resolution), "--yaw", str(yaw), "--depth-window", str(depth_window),
+            f"--render-resolution={render_resolution}", f"--yaw={yaw}", f"--depth-window={depth_window}",
         ]
         _run(command, python, repair, work_dir, (output_path, preview_path, proof_path))
         proof_text = json.dumps(json.loads(proof_path.read_text(encoding="utf-8")), ensure_ascii=False, indent=2)
+        keep.append(output_path)
         return {"ui": {"text": [proof_text]},
                 "result": (Types.File3D(str(output_path)), _image(preview_path), proof_text)}
 
