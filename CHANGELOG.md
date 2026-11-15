@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.1 — 2026-11-15
+
+- Find the head before trusting a face in the full source render. On a full-body character (head about 70 px wide in the 768 px render, stylised black eyes) the head was missed and the chest, with the nipples as eyes, was the only "face", so the photo was painted onto the chest (job d2d91062). The head is now read from the silhouette of the full render: going down from the top, head, narrower neck, then a shoulder row at least 1.6 head widths wide. A face whose nose lies below that row is discarded, and a native render of head and neck is searched instead; the same happens when the full render finds no face at all. There the job's head was found with the nose 52 px above the shoulder row. A face that is still below the shoulders is refused.
+- A silhouette without that shape (head-only mesh, bust without neck, side view) keeps the 1.6.0 path, as does every face found above the shoulders: the portrait grid and the cyan luminance case give byte-identical GLB, comparison and proof. When the head window was used, `source_full_observation` holds its attempts plus `head_window` (shoulder row, window, reason, nose row and the rejected full-render observation).
+- `GLB Face Regions` shares the head location and gets the same fix.
+- Add tests with a synthetic figure (head, neck, torso) and a size-limited fake detector: chest face replaced by the head, head window when the full render finds nothing, unchanged path for a face above the shoulders, refusal without a face on the head, shoulder row and head-only silhouette.
+
 ## 1.6.0 — 2026-11-12
 
 - New node **GLB Face Regions (Locate Only)** (`GLBFaceRegions`; worker `--locate`, `--preview-png`, `--depth-window`). It labels every vertex from MediaPipe landmarks of the head render: right/left eye with lid rim, right/left brow, lips and nose (`_FACE_REGION` 1–6, 0 = none). Hidden vertices up to `depth_window` (default 0.3 eye spans) behind the visible surface are included, such as eye sockets, the inside of the mouth and lash flaps. `_FACE_DEPTH` gives their distance behind the surface in eye spans. No photo is needed and no vertex moves: geometry, UVs, vertex order, images and materials stay byte-identical, and the original binary is an exact prefix.
