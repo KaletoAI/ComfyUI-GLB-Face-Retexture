@@ -423,5 +423,120 @@ class DetectFaceConfirmationTests(unittest.TestCase):
         with self.assertRaisesRegex(core.FaceTextureError, 'multiple faces are unsupported'):
             self.detect(rgb, 'Reference photo')
 
+
+def _figure(path, markers, cells=96):
+    """A flat +Z figure in [-1, 1]²: small head, narrow neck, wide torso.
+
+    Planar UVs map the square texture over the whole square, so a marker
+    painted at model coordinates appears on the figure exactly there.
+    """
+    n = cells + 1
+    xs = np.linspace(-1, 1, n)
+    xx, yy = np.meshgrid(xs, xs[::-1])
+    positions = np.c_[xx.ravel(), yy.ravel(), np.zeros(n * n)].astype('<f4')
+    uv = np.c_[(xx.ravel() + 1) / 2, (1 - yy.ravel()) / 2].astype('<f4')
+    corner = (np.arange(cells)[:, None] * n + np.arange(cells)[None, :]).ravel()
+    cx, cy = positions[corner + n + 1, 0] - 1/cells, positions[corner + n + 1, 1] + 1/cells
+    keep = (((np.abs(cx) < .15) & (cy > .6)) | ((np.abs(cx) < .075) & (cy > .44))
+            | ((np.abs(cx) < .5) & (cy < .46)))
+    corner = corner[keep]
+    triangles = np.r_[np.c_[corner, corner + n, corner + 1], np.c_[corner + 1, corner + n, corner + n + 1]].astype('<u4')
+    size = 1024
+    texture = np.full((size, size, 3), 225, np.uint8)
+    for colour, (x0, y0, x1, y1) in markers:
+        texture[round((1-y1)/2*size):round((1-y0)/2*size), round((x0+1)/2*size):round((x1+1)/2*size)] = colour
+    png = io.BytesIO()
+    Image.fromarray(texture).save(png, format='PNG')
+    binary = bytearray()
+    views = []
+    for chunk in (triangles.tobytes(), positions.tobytes(), uv.tobytes(), png.getvalue()):
+        binary.extend(b'\0' * (-len(binary) % 4))
+        views.append({'buffer': 0, 'byteOffset': len(binary), 'byteLength': len(chunk)})
+        binary.extend(chunk)
+    binary.extend(b'\0' * (-len(binary) % 4))
+    doc = {'asset': {'version': '2.0'}, 'scene': 0, 'scenes': [{'nodes': [0]}], 'nodes': [{'mesh': 0}],
+           'meshes': [{'primitives': [{'attributes': {'POSITION': 1, 'TEXCOORD_0': 2}, 'indices': 0, 'material': 0}]}],
+           'buffers': [{'byteLength': len(binary)}], 'bufferViews': views,
+           'accessors': [{'bufferView': 0, 'componentType': 5125, 'count': triangles.size, 'type': 'SCALAR'},
+                         {'bufferView': 1, 'componentType': 5126, 'count': n * n, 'type': 'VEC3'},
+                         {'bufferView': 2, 'componentType': 5126, 'count': n * n, 'type': 'VEC2'}],
+           'images': [{'bufferView': 3, 'mimeType': 'image/png'}], 'textures': [{'source': 0}],
+           'materials': [{'pbrMetallicRoughness': {'baseColorTexture': {'index': 0}}}]}
+    payload = json.dumps(doc).encode()
+    payload += b' ' * (-len(payload) % 4)
+    path.write_bytes(struct.pack('<4sII', b'glTF', 2, 28 + len(payload) + len(binary))
+                     + struct.pack('<II', len(payload), 0x4E4F534A) + payload
+                     + struct.pack('<II', len(binary), 0x004E4942) + binary)
+
+
+class _SmallHeadDetector:
+    """Like MediaPipe on a full-body render: a marker narrower than `minimum`
+    of the view is missed, so only the large body "face" is reported there."""
+
+    def __init__(self, minimum=.12):
+        self.minimum = minimum
+
+    def detect(self, image):
+        faces = [lm for lm in (_marker_face(image.data, colour) for colour in (_REAL, _GHOST))
+                 if lm is not None and np.ptp(lm[:, 0]) >= self.minimum]
+        return type('Result', (), {'face_landmarks': [[_Point(*xy) for xy in lm] for lm in faces]})()
+
+
+_HEAD_FACE = (_REAL, (-.08, .7, .08, .9))
+_CHEST_GHOST = (_GHOST, (-.3, -.3, .3, .1))
+
+
+@unittest.skipIf(WORKER_IMPORT_ERROR is not None, "Standalone ComfyUI worker dependencies unavailable: " + str(WORKER_IMPORT_ERROR))
+class HeadPriorTests(unittest.TestCase):
+    """Job d2d91062: on a full-body render the small head was missed and the
+    chest (nipples as eyes) was the only "face", so the chest got the photo."""
+
+    def observe(self, markers, detector):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'figure.glb'
+            _figure(path, markers)
+            source = core.read_source(path)
+        return core.observe_source(detector, _FakeMp, source, 768, 0)
+
+    def test_shoulder_row_is_found_below_the_head(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'figure.glb'
+            _figure(path, [])
+            source = core.read_source(path)
+        view = core.make_view(source['positions'], 768, 0)
+        head = core.head_window(core.render_albedo(source, view)['owners'])
+        # Model y .46 (top of the torso) in a 2.12-unit-high view.
+        self.assertAlmostEqual(head['shoulder_row'], (1.06 - .46) / 2.12 * 768, delta=6)
+
+    def test_head_only_mesh_has_no_shoulder_row(self):
+        owners = np.full((64, 64), -1)
+        owners[8:56, 16:48] = 0
+        self.assertIsNone(core.head_window(owners))
+
+    def test_body_face_below_the_shoulders_is_replaced_by_the_head(self):
+        observed = self.observe([_HEAD_FACE, _CHEST_GHOST], _SmallHeadDetector())
+        full_observation, view, source_lm = observed[2], observed[3], observed[5]
+        self.assertEqual(full_observation['head_window']['reason'], 'face_below_shoulders')
+        # The native head render is centred on the head, not on the chest.
+        left, bottom, right, top = view['bounds']
+        self.assertGreater(bottom, .46)
+        nose = (left + source_lm[1, 0]*(right-left), top - source_lm[1, 1]*(top-bottom))
+        np.testing.assert_allclose(nose, (0, .8), atol=.02)
+
+    def test_head_window_also_runs_when_the_full_render_finds_nothing(self):
+        # Half-size search crops still show the head below 20 % of their width.
+        observed = self.observe([_HEAD_FACE], _SmallHeadDetector(minimum=.2))
+        self.assertEqual(observed[2]['head_window']['reason'], 'no_face_in_full_render')
+
+    def test_face_above_the_shoulders_keeps_the_full_render_path(self):
+        observed = self.observe([_HEAD_FACE], _SmallHeadDetector(minimum=0))
+        self.assertNotIn('head_window', observed[2])
+        self.assertEqual(observed[2]['attempts'][0]['kind'], 'full_image')
+
+    def test_no_face_on_the_head_is_refused(self):
+        with self.assertRaisesRegex(core.FaceTextureError, 'Source mesh render'):
+            self.observe([_CHEST_GHOST], _SmallHeadDetector())
+
+
 if __name__ == '__main__':
     unittest.main()

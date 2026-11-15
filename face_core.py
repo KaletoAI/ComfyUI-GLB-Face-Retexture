@@ -1275,24 +1275,95 @@ def _write_outputs(files):
             temporary.unlink(missing_ok=True)
 
 
-def observe_source(detector, mp, source, render_resolution, yaw):
-    """Locate the head in a full render, re-render it natively and detect its landmarks."""
-    full_view = make_view(source['positions'], render_resolution, yaw)
-    full_render = render_albedo(source, full_view)
-    initial_lm, initial_box, full_observation = detect_face(detector, mp, full_render['rgb'], 'Source mesh render',
-                                                            locate_only=True, mesh_render=True)
-    # Re-render the detected head at native resolution rather than merely
-    # enlarging low-resolution body pixels. Camera derives from observation.
-    x0, y0, x1, y1 = initial_box
-    left, bottom, right, top = full_view['bounds']
-    bounds = (left+x0/render_resolution*(right-left), top-y1/render_resolution*(top-bottom),
-              left+x1/render_resolution*(right-left), top-y0/render_resolution*(top-bottom))
+def head_window(owners):
+    """Find the head from the silhouette of an upright front render.
+
+    Going down from the top, the head is followed by a narrower neck and then
+    by shoulders at least 1.6 head widths wide. Returns the shoulder row and a
+    square pixel window over head and neck, or None for a silhouette without
+    that shape (head-only mesh, bust without neck, side view, wide hair).
+    """
+    width = (owners >= 0).sum(axis=1)
+    filled = np.flatnonzero(width)
+    if len(filled) == 0:
+        return None
+    head, neck = 0, False
+    for row in range(filled[0], filled[-1]+1):
+        if neck and width[row] >= 1.6*head:
+            columns = np.flatnonzero((owners[filled[0]:row] >= 0).any(axis=0))
+            side = 1.3*max(row-filled[0], columns[-1]+1-columns[0])
+            x0, y0 = (columns[0]+columns[-1]+1)/2 - side/2, filled[0] - .05*side
+            return {'shoulder_row': int(row),
+                    'window_pixels': [float(x0), float(y0), float(x0+side), float(y0+side)]}
+        if not neck:
+            head = max(head, width[row])
+            neck = width[row] < .8*head
+    return None
+
+
+def _crop_bounds(view, box):
+    """Square model-space camera bounds around pixel box `box` of `view`."""
+    x0, y0, x1, y1 = box
+    resolution = view['resolution']
+    left, bottom, right, top = view['bounds']
+    bounds = (left+x0/resolution*(right-left), top-y1/resolution*(top-bottom),
+              left+x1/resolution*(right-left), top-y0/resolution*(top-bottom))
     # Clipping the detected crop at a full-render border must not change
     # the head's aspect ratio. Extend camera bounds, not source geometry.
     center_x, center_y = (bounds[0]+bounds[2])/2, (bounds[1]+bounds[3])/2
     half_span = max(bounds[2]-bounds[0], bounds[3]-bounds[1])/2
-    bounds = (center_x-half_span, center_y-half_span, center_x+half_span, center_y+half_span)
-    view = make_view(source['positions'], render_resolution, yaw, bounds)
+    return (center_x-half_span, center_y-half_span, center_x+half_span, center_y+half_span)
+
+
+def _full_row(view, full_view, landmarks):
+    """Full-render pixel row of the nose tip detected in `view`."""
+    left, bottom, right, top = view['bounds']
+    y = top - landmarks[1, 1]*(top-bottom)
+    left, bottom, right, top = full_view['bounds']
+    return float((top-y)/(top-bottom)*full_view['resolution'])
+
+
+def observe_source(detector, mp, source, render_resolution, yaw):
+    """Locate the head in a full render, re-render it natively and detect its landmarks."""
+    full_view = make_view(source['positions'], render_resolution, yaw)
+    full_render = render_albedo(source, full_view)
+    head = head_window(full_render['owners'])
+    try:
+        initial_lm, initial_box, full_observation = detect_face(detector, mp, full_render['rgb'], 'Source mesh render',
+                                                                locate_only=True, mesh_render=True)
+        failure, reason = None, None
+        if head is not None and _full_row(full_view, full_view, initial_lm) >= head['shoulder_row']:
+            reason = 'face_below_shoulders'
+    except FaceTextureError as error:
+        failure, reason = error, 'no_face_in_full_render'
+    locate_view = full_view
+    if reason is not None:
+        if head is None:
+            raise failure
+        # On a full-body render the head is small and can be missed while body
+        # texture (a chest with nipples as eyes) is taken for a face. A face
+        # sits above the shoulders: search a native render of head and neck.
+        locate_view = make_view(source['positions'], render_resolution, yaw,
+                                _crop_bounds(full_view, head['window_pixels']))
+        try:
+            initial_lm, initial_box, observation = detect_face(
+                detector, mp, render_albedo(source, locate_view)['rgb'], 'Source mesh render',
+                locate_only=True, mesh_render=True)
+        except FaceTextureError:
+            if failure is not None:
+                raise failure
+            raise FaceTextureError('Source mesh render: the only face found is below the shoulders and the head '
+                                   'shows none; use a frontal upright mesh or correct source yaw') from None
+        nose_row = _full_row(locate_view, full_view, initial_lm)
+        if nose_row >= head['shoulder_row']:
+            raise FaceTextureError('Source mesh render: no face found above the shoulders; '
+                                   'use a frontal upright mesh or correct source yaw')
+        rejected = None if failure is not None else full_observation
+        full_observation = dict(observation, head_window=dict(head, reason=reason, nose_row=nose_row,
+                                                              rejected_full_render=rejected))
+    # Re-render the detected head at native resolution rather than merely
+    # enlarging low-resolution body pixels. Camera derives from observation.
+    view = make_view(source['positions'], render_resolution, yaw, _crop_bounds(locate_view, initial_box))
     before = render_albedo(source, view)
     source_lm, source_box, source_observation = detect_face(detector, mp, before['rgb'], 'Refined source head render',
                                                              mesh_render=True)
